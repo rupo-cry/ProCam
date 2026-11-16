@@ -213,8 +213,8 @@ jobs:
               try {
                 val sel = if (back) CameraSelector.DEFAULT_BACK_CAMERA else CameraSelector.DEFAULT_FRONT_CAMERA
                 camera = p.bindToLifecycle(this, sel, preview, capture)
-                val s = capture.resolutionInfo?.resolution
-                info.text = "Video ${s?.width}x${s?.height} @ ${fps}fps"
+                info.text = "Video 1080p @ ${fps}fps"
+                
               } catch (e: Exception) {
                 if (fps == 60) {
                   fps = 30

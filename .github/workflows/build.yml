@@ -74,7 +74,7 @@ jobs:
             <uses-permission android:name="android.permission.CAMERA" />
             <uses-permission android:name="android.permission.RECORD_AUDIO" />
             <application android:label="Pro Cam" android:theme="@android:style/Theme.Material.NoActionBar">
-              <activity android:name=".MainActivity" android:exported="true" android:screenOrientation="portrait">
+              <activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
                 <intent-filter>
                   <action android:name="android.intent.action.MAIN" />
                   <category android:name="android.intent.category.LAUNCHER" />
@@ -88,96 +88,264 @@ jobs:
 
           import android.Manifest
           import android.content.ContentValues
+          import android.content.Context
+          import android.content.pm.ActivityInfo
           import android.content.pm.PackageManager
+          import android.content.res.Configuration
+          import android.graphics.Canvas
           import android.graphics.Color
+          import android.graphics.Paint
+          import android.hardware.camera2.CameraCharacteristics
           import android.hardware.camera2.CaptureRequest
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.provider.MediaStore
           import android.util.Range
           import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
           import android.view.WindowManager
           import android.widget.*
           import androidx.activity.ComponentActivity
           import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.camera.camera2.interop.Camera2CameraControl
+          import androidx.camera.camera2.interop.Camera2CameraInfo
           import androidx.camera.camera2.interop.Camera2Interop
+          import androidx.camera.camera2.interop.CaptureRequestOptions
           import androidx.camera.core.*
           import androidx.camera.lifecycle.ProcessCameraProvider
           import androidx.camera.video.*
           import androidx.camera.view.PreviewView
           import androidx.core.content.ContextCompat
 
+          class GridView(c: Context) : View(c) {
+            private val p = Paint()
+            init { p.color = Color.argb(140, 255, 255, 255); p.strokeWidth = 2f }
+            override fun onDraw(cv: Canvas) {
+              val w = width.toFloat()
+              val h = height.toFloat()
+              cv.drawLine(w / 3, 0f, w / 3, h, p)
+              cv.drawLine(2 * w / 3, 0f, 2 * w / 3, h, p)
+              cv.drawLine(0f, h / 3, w, h / 3, p)
+              cv.drawLine(0f, 2 * h / 3, w, 2 * h / 3, p)
+            }
+          }
+
           class MainActivity : ComponentActivity() {
             private lateinit var pv: PreviewView
             private lateinit var info: TextView
+            private lateinit var grid: GridView
+            private lateinit var panel: LinearLayout
+            private lateinit var panelScroll: ScrollView
             private lateinit var recBtn: Button
             private lateinit var fpsBtn: Button
+            private lateinit var evSb: SeekBar
+            private lateinit var isoSb: SeekBar
+            private lateinit var shSb: SeekBar
+            private lateinit var focSb: SeekBar
+            private val handler = Handler(Looper.getMainLooper())
             private var provider: ProcessCameraProvider? = null
             private var camera: Camera? = null
+            private var prev: Preview? = null
             private var vc: VideoCapture<Recorder>? = null
             private var recording: Recording? = null
             private var fps = 60
             private var back = true
             private var torch = false
+            private var stab = false
+            private var timerSec = 0
+            private var counting = false
+            private val rates = intArrayOf(10, 20, 30, 50, 80)
+            private var ri = 2
+            private var om = 1
+            private var evLo = 0
+            private var evStep = 0f
+            private var manExp = false
+            private var manFoc = false
+            private var wasManual = false
+            private var isoLo = 100
+            private var isoHi = 800
+            private var shDen = listOf<Int>()
+            private var minFocus = 0f
+            private var iso = 100
+            private var expNs = 16_666_666L
+            private var focusD = 0f
 
             private val permLauncher = registerForActivityResult(
               ActivityResultContracts.RequestMultiplePermissions()
             ) { r -> if (r[Manifest.permission.CAMERA] == true) startCamera() else info.text = "Camera permission needed" }
 
+            private fun btn(t: String, f: (Button) -> Unit): Button {
+              val b = Button(this)
+              b.text = t
+              b.textSize = 11f
+              b.setAllCaps(false)
+              b.minWidth = 0
+              b.minimumWidth = 0
+              b.setOnClickListener { f(b) }
+              return b
+            }
+
+            private fun row(vararg bs: Button): LinearLayout {
+              val r = LinearLayout(this)
+              r.orientation = LinearLayout.HORIZONTAL
+              for (b in bs) r.addView(b, LinearLayout.LayoutParams(0, -2, 1f))
+              return r
+            }
+
+            private fun slider(parent: LinearLayout, name: String, max: Int, cb: (Int) -> String): SeekBar {
+              val r = LinearLayout(this)
+              r.orientation = LinearLayout.HORIZONTAL
+              r.gravity = Gravity.CENTER_VERTICAL
+              val l = TextView(this)
+              l.setTextColor(Color.WHITE)
+              l.textSize = 12f
+              l.text = name
+              l.minWidth = 170
+              val v = TextView(this)
+              v.setTextColor(Color.WHITE)
+              v.textSize = 12f
+              v.minWidth = 190
+              v.gravity = Gravity.END
+              val sb = SeekBar(this)
+              sb.max = max
+              sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) { v.text = cb(p) }
+                override fun onStartTrackingTouch(s: SeekBar?) {}
+                override fun onStopTrackingTouch(s: SeekBar?) {}
+              })
+              r.addView(l)
+              r.addView(sb, LinearLayout.LayoutParams(0, -2, 1f))
+              r.addView(v)
+              parent.addView(r)
+              return sb
+            }
+
             override fun onCreate(savedInstanceState: Bundle?) {
               super.onCreate(savedInstanceState)
               window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+              requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
               val root = FrameLayout(this)
               root.setBackgroundColor(Color.BLACK)
               pv = PreviewView(this)
+              pv.setOnTouchListener { _, e ->
+                if (e.action == MotionEvent.ACTION_UP) {
+                  val pt = pv.meteringPointFactory.createPoint(e.x, e.y)
+                  camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
+                }
+                true
+              }
               root.addView(pv, FrameLayout.LayoutParams(-1, -1))
+              grid = GridView(this)
+              grid.visibility = View.GONE
+              root.addView(grid, FrameLayout.LayoutParams(-1, -1))
               info = TextView(this)
               info.setTextColor(Color.WHITE)
               info.textSize = 15f
               info.setPadding(32, 80, 32, 0)
               root.addView(info, FrameLayout.LayoutParams(-2, -2, Gravity.TOP))
 
-              fun btn(t: String, f: () -> Unit): Button {
-                val b = Button(this)
-                b.text = t
-                b.setOnClickListener { f() }
-                return b
+              panel = LinearLayout(this)
+              panel.orientation = LinearLayout.VERTICAL
+              panel.setPadding(16, 8, 16, 8)
+              panel.setBackgroundColor(Color.argb(170, 0, 0, 0))
+              panelScroll = ScrollView(this)
+              panelScroll.visibility = View.GONE
+              panelScroll.addView(panel)
+
+              fpsBtn = btn("60fps") { b ->
+                if (recording == null && !counting) { fps = if (fps == 60) 30 else 60; b.text = "${fps}fps"; rebind() }
               }
-              val zoom = SeekBar(this)
-              zoom.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                override fun onProgressChanged(s: SeekBar?, p: Int, u: Boolean) {
-                  camera?.cameraControl?.setLinearZoom(p / 100f)
-                }
-                override fun onStartTrackingTouch(s: SeekBar?) {}
-                override fun onStopTrackingTouch(s: SeekBar?) {}
-              })
-              fpsBtn = btn("60fps") {
-                if (recording == null) {
-                  fps = if (fps == 60) 30 else 60
-                  fpsBtn.text = "${fps}fps"
-                  rebind()
-                }
+              val bitBtn = btn("30 Mbps") { b ->
+                if (recording == null) { ri = (ri + 1) % rates.size; b.text = "${rates[ri]} Mbps"; rebind() }
               }
-              recBtn = btn("REC") { toggleRec() }
-              val torchBtn = btn("Torch") {
+              val timerBtn = btn("Timer:Off") { b ->
+                timerSec = when (timerSec) { 0 -> 3; 3 -> 10; else -> 0 }
+                b.text = if (timerSec == 0) "Timer:Off" else "Timer:${timerSec}s"
+              }
+              val gridBtn = btn("Grid:Off") { b ->
+                val on = grid.visibility != View.VISIBLE
+                grid.visibility = if (on) View.VISIBLE else View.GONE
+                b.text = if (on) "Grid:On" else "Grid:Off"
+              }
+              val stabBtn = btn("Stab:Off") { b ->
+                if (recording == null) { stab = !stab; b.text = if (stab) "Stab:On" else "Stab:Off"; rebind() }
+              }
+              val torchBtn = btn("Torch:Off") { b ->
                 torch = !torch
                 camera?.cameraControl?.enableTorch(torch)
+                b.text = if (torch) "Torch:On" else "Torch:Off"
               }
-              val flipBtn = btn("Flip") {
+              val names = arrayOf("Rot:Auto", "Rot:Port", "Rot:Land")
+              val oriBtn = btn("Rot:Port") { b ->
                 if (recording == null) {
-                  back = !back
-                  torch = false
-                  rebind()
+                  om = (om + 1) % 3
+                  requestedOrientation = when (om) {
+                    0 -> ActivityInfo.SCREEN_ORIENTATION_FULL_SENSOR
+                    1 -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                    else -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                  }
+                  b.text = names[om]
                 }
               }
-              val bar = LinearLayout(this)
-              bar.orientation = LinearLayout.HORIZONTAL
-              bar.gravity = Gravity.CENTER
-              for (b in listOf(fpsBtn, torchBtn, recBtn, flipBtn)) bar.addView(b)
+              val expBtn = btn("Exposure:Auto") { b ->
+                manExp = !manExp
+                b.text = if (manExp) "Exposure:Manual" else "Exposure:Auto"
+                applyManual()
+              }
+              val focBtn = btn("Focus:Auto") { b ->
+                manFoc = !manFoc
+                b.text = if (manFoc) "Focus:Manual" else "Focus:Auto"
+                applyManual()
+              }
+              panel.addView(row(fpsBtn, bitBtn, timerBtn, gridBtn))
+              panel.addView(row(stabBtn, torchBtn, oriBtn))
+              panel.addView(row(expBtn, focBtn))
+              evSb = slider(panel, "EV", 0) { p ->
+                camera?.cameraControl?.setExposureCompensationIndex(p + evLo)
+                String.format("%.1f", (p + evLo) * evStep)
+              }
+              isoSb = slider(panel, "ISO", 100) { p ->
+                iso = isoFor(p)
+                applyManual()
+                "$iso"
+              }
+              shSb = slider(panel, "Shutter", 0) { p ->
+                if (shDen.isEmpty()) "-" else {
+                  val d = shDen[p.coerceIn(0, shDen.size - 1)]
+                  expNs = 1_000_000_000L / d
+                  applyManual()
+                  "1/$d"
+                }
+              }
+              focSb = slider(panel, "Focus", 100) { p ->
+                focusD = p / 100f * minFocus
+                applyManual()
+                if (p == 0 || focusD <= 0f) "inf" else "${(100f / focusD).toInt()}cm"
+              }
+
               val col = LinearLayout(this)
               col.orientation = LinearLayout.VERTICAL
               col.setPadding(32, 0, 32, 96)
-              col.addView(zoom)
-              col.addView(bar)
+              col.addView(panelScroll, LinearLayout.LayoutParams(-1, 0))
+              slider(col, "Zoom", 100) { p ->
+                camera?.cameraControl?.setLinearZoom(p / 100f)
+                "$p%"
+              }
+              val menuBtn = btn("Menu") {
+                val show = panelScroll.visibility != View.VISIBLE
+                panelScroll.visibility = if (show) View.VISIBLE else View.GONE
+                val lp = panelScroll.layoutParams
+                lp.height = if (show) resources.displayMetrics.heightPixels * 2 / 5 else 0
+                panelScroll.layoutParams = lp
+              }
+              recBtn = btn("REC") { onRecClick() }
+              recBtn.textSize = 16f
+              val flipBtn = btn("Flip") {
+                if (recording == null) { back = !back; torch = false; rebind() }
+              }
+              col.addView(row(menuBtn, recBtn, flipBtn))
               root.addView(col, FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM))
               setContentView(root)
 
@@ -185,6 +353,16 @@ jobs:
               if (need.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) startCamera()
               else permLauncher.launch(need)
             }
+
+            override fun onConfigurationChanged(c: Configuration) {
+              super.onConfigurationChanged(c)
+              @Suppress("DEPRECATION")
+              val r = windowManager.defaultDisplay.rotation
+              prev?.targetRotation = r
+              if (recording == null) vc?.targetRotation = r
+            }
+
+            private fun isoFor(p: Int): Int = (isoLo * Math.pow(isoHi.toDouble() / isoLo, p / 100.0)).toInt()
 
             private fun startCamera() {
               val f = ProcessCameraProvider.getInstance(this)
@@ -202,19 +380,25 @@ jobs:
               Camera2Interop.Extender(pb).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
               val preview = pb.build()
               preview.setSurfaceProvider(pv.surfaceProvider)
+              prev = preview
               val recorder = Recorder.Builder()
                 .setQualitySelector(QualitySelector.from(Quality.FHD, FallbackStrategy.lowerQualityOrHigherThan(Quality.FHD)))
-                .setTargetVideoEncodingBitRate(30_000_000)
+                .setTargetVideoEncodingBitRate(rates[ri] * 1_000_000)
                 .build()
               val vb = VideoCapture.Builder(recorder).setTargetFrameRate(range)
-              Camera2Interop.Extender(vb).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+              val ex = Camera2Interop.Extender(vb)
+              ex.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+              if (stab) ex.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
               val capture = vb.build()
               vc = capture
               try {
                 val sel = if (back) CameraSelector.DEFAULT_BACK_CAMERA else CameraSelector.DEFAULT_FRONT_CAMERA
-                camera = p.bindToLifecycle(this, sel, preview, capture)
-                info.text = "Video 1080p @ ${fps}fps"
-                
+                val cam = p.bindToLifecycle(this, sel, preview, capture)
+                camera = cam
+                readCaps(cam)
+                cam.cameraControl.enableTorch(torch)
+                applyManual()
+                info.text = "Video 1080p @ ${fps}fps, ${rates[ri]} Mbps"
               } catch (e: Exception) {
                 if (fps == 60) {
                   fps = 30
@@ -225,12 +409,94 @@ jobs:
               }
             }
 
-            private fun toggleRec() {
+            private fun readCaps(cam: Camera) {
+              val es = cam.cameraInfo.exposureState
+              val er = es.exposureCompensationRange
+              evLo = er.lower
+              evStep = es.exposureCompensationStep.toFloat()
+              evSb.max = er.upper - er.lower
+              evSb.progress = -er.lower
+              try {
+                val ci = Camera2CameraInfo.from(cam.cameraInfo)
+                val ir = ci.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                if (ir != null) { isoLo = ir.lower; isoHi = minOf(ir.upper, 6400) }
+                val tr = ci.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                val dens = listOf(8000, 4000, 2000, 1000, 500, 250, 125, 60, 30)
+                shDen = dens.filter { d ->
+                  val ns = 1_000_000_000L / d
+                  d >= fps && (tr == null || (ns >= tr.lower && ns <= tr.upper))
+                }
+                minFocus = ci.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+              } catch (e: Exception) {
+                shDen = listOf()
+              }
+              shSb.max = maxOf(shDen.size - 1, 0)
+              shSb.progress = maxOf(shDen.size - 2, 0)
+              isoSb.progress = 30
+              focSb.progress = 0
+              iso = isoFor(isoSb.progress)
+              if (shDen.isNotEmpty()) expNs = 1_000_000_000L / shDen[shSb.progress.coerceIn(0, shDen.size - 1)]
+              focusD = focSb.progress / 100f * minFocus
+            }
+
+            private fun applyManual() {
+              val cam = camera ?: return
+              try {
+                val c2 = Camera2CameraControl.from(cam.cameraControl)
+                if (!manExp && !manFoc) {
+                  if (wasManual) c2.clearCaptureRequestOptions()
+                  wasManual = false
+                  return
+                }
+                val b = CaptureRequestOptions.Builder()
+                if (manExp) {
+                  b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                  b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                  b.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, expNs)
+                }
+                if (manFoc) {
+                  b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                  b.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusD)
+                }
+                c2.setCaptureRequestOptions(b.build())
+                wasManual = true
+              } catch (e: Exception) {
+                info.text = "Manual not supported: ${e.message}"
+              }
+            }
+
+            private fun onRecClick() {
+              if (counting) {
+                counting = false
+                handler.removeCallbacksAndMessages(null)
+                info.text = ""
+                recBtn.text = "REC"
+                return
+              }
               val r = recording
               if (r != null) {
                 r.stop()
                 return
               }
+              if (timerSec > 0) {
+                counting = true
+                recBtn.text = "CANCEL"
+                countdown(timerSec)
+              } else startRec()
+            }
+
+            private fun countdown(n: Int) {
+              if (!counting) return
+              if (n == 0) {
+                counting = false
+                startRec()
+                return
+              }
+              info.text = "Starting in $n"
+              handler.postDelayed({ countdown(n - 1) }, 1000)
+            }
+
+            private fun startRec() {
               val cap = vc ?: return
               val cv = ContentValues()
               cv.put(MediaStore.Video.Media.DISPLAY_NAME, "ProCam_${System.currentTimeMillis()}")
@@ -258,4 +524,3 @@ jobs:
           tag_name: build-${{ github.run_number }}
           name: ProCam build ${{ github.run_number }}
           files: app/build/outputs/apk/debug/app-debug.apk
-          

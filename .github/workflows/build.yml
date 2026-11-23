@@ -211,7 +211,7 @@ jobs:
                 if (x < 0f || x > w) continue
                 val fade = 1f - Math.min(1f, Math.abs(x - cx) / cx)
                 val al = (60 + 195 * fade).toInt()
-                val maj = major.contains(v)
+                val maj = major.any { it == v }
                 p.color = Color.argb(al, 255, 255, 255)
                 cv.drawLine(x, h * (if (maj) 0.34f else 0.48f), x, h * 0.66f, p)
                 if (maj) {

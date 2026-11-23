@@ -49,7 +49,7 @@ jobs:
               minSdk = 29
               targetSdk = 34
               versionCode = 1
-              versionName = "1.0"
+              versionName = "1.1"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -66,6 +66,8 @@ jobs:
             implementation("androidx.camera:camera-lifecycle:$c")
             implementation("androidx.camera:camera-video:$c")
             implementation("androidx.camera:camera-view:$c")
+            implementation("androidx.camera:camera-extensions:$c")
+            implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
           }
           EOF
           cat > app/src/main/AndroidManifest.xml <<'EOF'
@@ -73,7 +75,7 @@ jobs:
             <uses-feature android:name="android.hardware.camera" android:required="false" />
             <uses-permission android:name="android.permission.CAMERA" />
             <uses-permission android:name="android.permission.RECORD_AUDIO" />
-            <application android:label="Pro Cam" android:theme="@android:style/Theme.Material.NoActionBar">
+            <application android:label="Pro Cam" android:largeHeap="true" android:theme="@android:style/Theme.Material.NoActionBar">
               <activity android:name=".MainActivity" android:exported="true" android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden">
                 <intent-filter>
                   <action android:name="android.intent.action.MAIN" />
@@ -87,12 +89,19 @@ jobs:
           package com.rupom.procam
 
           import android.Manifest
+          import android.animation.LayoutTransition
+          import android.animation.ValueAnimator
+          import android.app.AlertDialog
+          import android.content.ContentUris
           import android.content.ContentValues
           import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
           import android.content.res.Configuration
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
           import android.graphics.Canvas
+          import android.graphics.Matrix
           import android.graphics.Color
           import android.graphics.Paint
           import android.graphics.drawable.GradientDrawable
@@ -103,8 +112,16 @@ jobs:
           import android.os.Handler
           import android.os.Looper
           import android.provider.MediaStore
+          import android.provider.Settings
           import android.util.Range
+          import android.util.Rational
           import android.util.Size
+          import android.view.GestureDetector
+          import android.view.HapticFeedbackConstants
+          import android.view.KeyEvent
+          import android.view.animation.AccelerateInterpolator
+          import android.view.animation.DecelerateInterpolator
+          import android.view.animation.OvershootInterpolator
           import android.view.Gravity
           import android.view.MotionEvent
           import android.view.ScaleGestureDetector
@@ -118,6 +135,13 @@ jobs:
           import androidx.camera.camera2.interop.Camera2Interop
           import androidx.camera.camera2.interop.CaptureRequestOptions
           import androidx.camera.core.*
+          import androidx.camera.extensions.ExtensionMode
+          import androidx.camera.extensions.ExtensionsManager
+          import com.google.android.gms.tasks.Tasks
+          import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.segmentation.Segmentation
+          import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
+          import java.io.ByteArrayOutputStream
           import androidx.camera.lifecycle.ProcessCameraProvider
           import androidx.camera.video.*
           import androidx.camera.view.PreviewView
@@ -133,6 +157,71 @@ jobs:
               cv.drawLine(2 * w / 3, 0f, 2 * w / 3, h, p)
               cv.drawLine(0f, h / 3, w, h / 3, p)
               cv.drawLine(0f, 2 * h / 3, w, 2 * h / 3, p)
+            }
+          }
+
+          class ZoomWheel(c: Context, private val onMult: (Float) -> Unit) : View(c) {
+            var zmin = 1f
+            var zmax = 1f
+            var cur = 1f
+            private val dn = c.resources.displayMetrics.density
+            private val ppo = 170f * dn
+            private val p = Paint()
+            private val tp = Paint()
+            private var anim: ValueAnimator? = null
+            private var last = 0f
+            private val vals = floatArrayOf(0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1f, 1.2f, 1.4f, 1.6f, 1.8f, 2f, 2.5f, 3f, 4f, 5f, 6f, 8f, 10f, 15f, 20f, 30f)
+            private val major = floatArrayOf(0.6f, 1f, 2f, 3f, 5f, 10f, 20f)
+            private val gd = GestureDetector(c, object : GestureDetector.SimpleOnGestureListener() {
+              override fun onDown(e: MotionEvent): Boolean { anim?.cancel(); return true }
+              override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean { mult(dx); return true }
+              override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
+                anim?.cancel()
+                last = 0f
+                val a = ValueAnimator.ofFloat(0f, -vx * 0.3f)
+                a.duration = 800
+                a.interpolator = DecelerateInterpolator(2f)
+                a.addUpdateListener { v ->
+                  val x = v.animatedValue as Float
+                  mult(x - last)
+                  last = x
+                }
+                anim = a
+                a.start()
+                return true
+              }
+            })
+            init {
+              p.isAntiAlias = true
+              tp.isAntiAlias = true
+              tp.color = Color.WHITE
+              tp.textSize = 11f * dn
+              tp.textAlign = Paint.Align.CENTER
+            }
+            private fun mult(dx: Float) { onMult(Math.pow(2.0, (dx / ppo).toDouble()).toFloat()) }
+            override fun onTouchEvent(e: MotionEvent): Boolean = gd.onTouchEvent(e)
+            override fun onDraw(cv: Canvas) {
+              val w = width.toFloat()
+              val h = height.toFloat()
+              val cx = w / 2
+              p.strokeWidth = 2f * dn
+              for (v in vals) {
+                if (v < zmin - 0.01f || v > zmax + 0.01f) continue
+                val x = cx + (Math.log((v / cur).toDouble()) / Math.log(2.0)).toFloat() * ppo
+                if (x < 0f || x > w) continue
+                val fade = 1f - Math.min(1f, Math.abs(x - cx) / cx)
+                val al = (60 + 195 * fade).toInt()
+                val maj = major.contains(v)
+                p.color = Color.argb(al, 255, 255, 255)
+                cv.drawLine(x, h * (if (maj) 0.34f else 0.48f), x, h * 0.66f, p)
+                if (maj) {
+                  tp.alpha = al
+                  cv.drawText(if (v == v.toInt().toFloat()) "${v.toInt()}x" else "$v", x, h * 0.28f, tp)
+                }
+              }
+              p.color = Color.parseColor("#FF2D4B")
+              p.strokeWidth = 3f * dn
+              cv.drawLine(cx, h * 0.22f, cx, h * 0.78f, p)
             }
           }
 
@@ -203,9 +292,36 @@ jobs:
             private var shDen = listOf<Int>()
             private var iso = 100
             private var expNs = 8_000_000L
+            private var zmin = 1f
+            private var zmax = 1f
+            private var zTarget = 1f
+            private var zCur = 1f
+            private var zRunning = false
+            private var dragging = false
+            private var lastSel = -2
+            private var maxHz = true
+            private var hzMax = 60
+            private lateinit var zoomWheel: ZoomWheel
+            private lateinit var ratioRow: LinearLayout
+            private lateinit var flashView: View
+            private var vRatio = 0
+            private var procOn = true
+            private var procLevel = 1
+            private var portraitZoom = 1.5f
+            private var extMgr: ExtensionsManager? = null
+            private var camStarted = false
+            private var hwBokeh = false
+            private val modeIds = intArrayOf(0, 3, 1, 2)
+            private val vNames = arrayOf("16:9", "4:3", "Cinematic", "1:1")
+            private val hideToast = Runnable { reveal(toastV, false) }
+            private lateinit var zoomLabel: TextView
+            private lateinit var settingsTitle: TextView
+            private lateinit var photoBox: LinearLayout
+            private lateinit var videoBox: LinearLayout
             private val resQ = arrayOf(Quality.FHD, Quality.FHD, Quality.UHD, Quality.HD, Quality.HD)
             private val resF = intArrayOf(60, 30, 30, 60, 30)
             private val resN = arrayOf("1080P 60FPS", "1080P 30FPS", "4K 30FPS", "720P 60FPS", "720P 30FPS")
+            private val resS = arrayOf("1080p60", "1080p30", "4K30", "720p60", "720p30")
             private val rates = intArrayOf(0, 10, 20, 30, 50, 80)
             private val wbNames = arrayOf("Tungsten", "Fluor", "Day", "Cloudy", "Shade")
             private val wbModes = intArrayOf(
@@ -218,7 +334,7 @@ jobs:
 
             private val permLauncher = registerForActivityResult(
               ActivityResultContracts.RequestMultiplePermissions()
-            ) { r -> if (r[Manifest.permission.CAMERA] == true) startCamera() else info.text = "Camera permission needed" }
+            ) { r -> if (r[Manifest.permission.CAMERA] == true) startCamera() else showPermissionDialog() }
 
             private fun dp(x: Int) = (x * resources.displayMetrics.density).toInt()
 
@@ -245,7 +361,67 @@ jobs:
               v.setPadding(dp(10), dp(8), dp(10), dp(8))
               v.background = bg(DARK, 18)
               v.setOnClickListener { f(v) }
+              press(v)
               return v
+            }
+
+            private fun press(v: View) {
+              v.setOnTouchListener { x, e ->
+                if (e.action == MotionEvent.ACTION_DOWN) x.animate().scaleX(0.92f).scaleY(0.92f).setDuration(90).start()
+                else if (e.action == MotionEvent.ACTION_UP || e.action == MotionEvent.ACTION_CANCEL)
+                  x.animate().scaleX(1f).scaleY(1f).setDuration(240).setInterpolator(OvershootInterpolator()).start()
+                false
+              }
+            }
+
+            private fun reveal(v: View, show: Boolean) {
+              v.animate().cancel()
+              if (show) {
+                if (v.visibility != View.VISIBLE) {
+                  v.alpha = 0f
+                  v.translationY = dp(30).toFloat()
+                  v.visibility = View.VISIBLE
+                }
+                v.animate().alpha(1f).translationY(0f).setDuration(280).setInterpolator(DecelerateInterpolator()).start()
+              } else if (v.visibility == View.VISIBLE) {
+                v.animate().alpha(0f).translationY(dp(30).toFloat()).setDuration(200).setInterpolator(AccelerateInterpolator())
+                  .withEndAction { v.visibility = View.GONE }.start()
+              }
+            }
+
+            private fun pop(v: View) {
+              v.scaleX = 0.6f
+              v.scaleY = 0.6f
+              v.animate().scaleX(1f).scaleY(1f).setDuration(380).setInterpolator(OvershootInterpolator()).start()
+            }
+
+            private fun fadePreview() {
+              pv.animate().cancel()
+              pv.alpha = 0.2f
+              pv.animate().alpha(1f).setStartDelay(250).setDuration(350).start()
+            }
+
+            private fun buildRatioRow() {
+              ratioRow.removeAllViews()
+              val names = if (mode == 1) vNames else if (mode == 3) arrayOf("1.5x", "3x") else arrayOf("4:3", "16:9")
+              val sel = if (mode == 1) vRatio else if (mode == 3) (if (portraitZoom >= 3f) 1 else 0) else if (ratio169) 1 else 0
+              for (i in names.indices) {
+                val c = chip(names[i]) {
+                  if (mode == 3) {
+                    portraitZoom = if (i == 1) 3f else 1.5f
+                    zoomTo(portraitZoom)
+                    buildRatioRow()
+                  } else if (recording == null && !counting) {
+                    if (mode == 1) vRatio = i else ratio169 = (i == 1)
+                    updateResChip()
+                    refreshers.forEach { it() }
+                    buildRatioRow()
+                    rebind()
+                  }
+                }
+                mark(c, i == sel)
+                ratioRow.addView(c, lp(-2, -2, 3))
+              }
             }
 
             private fun mark(v: TextView, on: Boolean) {
@@ -287,17 +463,18 @@ jobs:
               return sb
             }
 
-            private fun setting(name: String, value: () -> String, click: () -> Unit) {
-              val t = chip("") { x -> click(); x.text = "$name      ${value()}" }
+            private fun setting(parent: LinearLayout, name: String, value: () -> String, click: () -> Unit) {
+              val t = chip("") { x -> click(); x.text = "$name      ${value()}"; saveSettings() }
               t.gravity = Gravity.START or Gravity.CENTER_VERTICAL
               t.textSize = 15f
               t.text = "$name      ${value()}"
               refreshers.add { t.text = "$name      ${value()}" }
-              settingsBox.addView(t, lp(-1, -2, 4))
+              parent.addView(t, lp(-1, -2, 4))
             }
 
             override fun onCreate(savedInstanceState: Bundle?) {
               super.onCreate(savedInstanceState)
+              loadSettings()
               window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
               val root = FrameLayout(this)
               root.setBackgroundColor(Color.parseColor("#0B0712"))
@@ -315,11 +492,12 @@ jobs:
                   if (mode == 1) resIdx = (resIdx + 1) % resN.size else ratio169 = !ratio169
                   updateResChip()
                   refreshers.forEach { it() }
+                  buildRatioRow()
                   rebind()
                 }
               }
               hdrChip = chip("HDR") { toggleHdr() }
-              val setChip = chip("⚙") { settingsView.visibility = View.VISIBLE }
+              val setChip = chip("⚙") { openSettings() }
               val top = rowOf(flashChip, timerChip, resChip, hdrChip, setChip)
               top.setPadding(dp(6), dp(6), dp(6), dp(6))
               main.addView(top, lp(-1, -2))
@@ -330,8 +508,7 @@ jobs:
               val sg = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(d: ScaleGestureDetector): Boolean {
                   pinched = true
-                  val z = camera?.cameraInfo?.zoomState?.value?.zoomRatio ?: 1f
-                  camera?.cameraControl?.setZoomRatio(z * d.scaleFactor)
+                  zoomTo(zTarget * d.scaleFactor)
                   return true
                 }
               })
@@ -343,8 +520,12 @@ jobs:
               }
               area.addView(pv, FrameLayout.LayoutParams(-1, -1))
               grid = GridView(this)
-              grid.visibility = View.GONE
+              grid.visibility = if (gridOn) View.VISIBLE else View.GONE
               area.addView(grid, FrameLayout.LayoutParams(-1, -1))
+              flashView = View(this)
+              flashView.setBackgroundColor(Color.WHITE)
+              flashView.alpha = 0f
+              area.addView(flashView, FrameLayout.LayoutParams(-1, -1))
               focusBox = View(this)
               focusBox.background = bg(0, 4, Color.WHITE)
               focusBox.visibility = View.GONE
@@ -353,6 +534,11 @@ jobs:
               info.setTextColor(Color.WHITE)
               info.textSize = 16f
               area.addView(info, FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL))
+              ratioRow = LinearLayout(this)
+              ratioRow.orientation = LinearLayout.HORIZONTAL
+              val rl = FrameLayout.LayoutParams(-2, -2, Gravity.TOP or Gravity.CENTER_HORIZONTAL)
+              rl.topMargin = dp(34)
+              area.addView(ratioRow, rl)
 
               val zoomRow = LinearLayout(this)
               zoomRow.orientation = LinearLayout.HORIZONTAL
@@ -360,15 +546,26 @@ jobs:
               for (i in zoomVals.indices) {
                 val z = zoomVals[i]
                 val c = chip(if (z == 1f) "1x" else "$z".removeSuffix(".0")) {
-                  camera?.cameraControl?.setZoomRatio(z)
-                  markZoom(i)
+                  zoomTo(z)
                 }
                 zoomChips.add(c)
                 zoomRow.addView(c, lp(-2, -2, 2))
               }
-              val zl = FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+              zoomLabel = TextView(this)
+              zoomLabel.setTextColor(Color.WHITE)
+              zoomLabel.textSize = 13f
+              zoomLabel.text = "1.0x"
+              zoomLabel.gravity = Gravity.CENTER
+              zoomWheel = ZoomWheel(this) { m -> zoomTo(zTarget * m) }
+              val zcol = LinearLayout(this)
+              zcol.orientation = LinearLayout.VERTICAL
+              zcol.gravity = Gravity.CENTER_HORIZONTAL
+              zcol.addView(zoomLabel)
+              zcol.addView(zoomWheel, LinearLayout.LayoutParams(-1, dp(46)))
+              zcol.addView(zoomRow)
+              val zl = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)
               zl.bottomMargin = dp(8)
-              area.addView(zoomRow, zl)
+              area.addView(zcol, zl)
 
               proPanel = LinearLayout(this)
               proPanel.orientation = LinearLayout.VERTICAL
@@ -416,7 +613,7 @@ jobs:
               }
               proPanel.addView(reset, lp(-2, -2, 4))
               val pl = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)
-              pl.bottomMargin = dp(52)
+              pl.bottomMargin = dp(124)
               area.addView(proPanel, pl)
 
               toastV = TextView(this)
@@ -427,15 +624,820 @@ jobs:
               toastV.visibility = View.GONE
               toastV.setOnClickListener { openLast() }
               val tl = FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
-              tl.bottomMargin = dp(56)
+              tl.bottomMargin = dp(124)
               area.addView(toastV, tl)
               main.addView(area, lp(-1, 0, 0, 1f))
 
               val strip = LinearLayout(this)
               strip.orientation = LinearLayout.HORIZONTAL
               strip.gravity = Gravity.CENTER
-              val names = arrayOf("PHOTO", "VIDEO", "PRO")
+              val names = arrayOf("PHOTO", "PORTRAIT", "VIDEO", "PRO")
               for (i in names.indices) {
-                val c = chip(names[i]) { setMode(i) }
+                val c = chip(names[i]) { setMode(modeIds[i]) }
                 modeChips.add(c)
-                strip.addView(c
+                strip.addView(c, lp(-2, -2, 4))
+              }
+              main.addView(strip, lp(-1, -2, 2))
+
+              val ctl = FrameLayout(this)
+              thumb = ImageView(this)
+              thumb.scaleType = ImageView.ScaleType.CENTER_CROP
+              thumb.background = bg(DARK, 10, Color.parseColor("#8B5CF6"))
+              thumb.clipToOutline = true
+              thumb.setOnClickListener { openLast() }
+              press(thumb)
+              val tlp = FrameLayout.LayoutParams(dp(54), dp(54), Gravity.START or Gravity.CENTER_VERTICAL)
+              tlp.leftMargin = dp(24)
+              ctl.addView(thumb, tlp)
+              shutter = View(this)
+              shutter.setOnClickListener { onShutter() }
+              press(shutter)
+              ctl.addView(shutter, FrameLayout.LayoutParams(dp(76), dp(76), Gravity.CENTER))
+              val right = LinearLayout(this)
+              right.orientation = LinearLayout.VERTICAL
+              pauseChip = chip("⏸") { onPause(it) }
+              pauseChip.visibility = View.GONE
+              val flip = chip("⟳ Flip") {
+                if (recording != null) { pendingFlip = true; recording?.stop() }
+                else if (!counting) { back = !back; rebind() }
+              }
+              right.addView(pauseChip, lp(-2, -2, 3))
+              right.addView(flip, lp(-2, -2, 3))
+              val rlp = FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL)
+              rlp.rightMargin = dp(16)
+              ctl.addView(right, rlp)
+              main.addView(ctl, lp(-1, dp(100), 0))
+              root.addView(main, FrameLayout.LayoutParams(-1, -1))
+
+              settingsView = ScrollView(this)
+              settingsView.setBackgroundColor(Color.parseColor("#F00B0712"))
+              settingsView.visibility = View.GONE
+              settingsBox = LinearLayout(this)
+              settingsBox.orientation = LinearLayout.VERTICAL
+              settingsBox.setPadding(dp(14), dp(14), dp(14), dp(24))
+              settingsBox.layoutTransition = LayoutTransition()
+              settingsTitle = chip("←  Settings") { reveal(settingsView, false) }
+              settingsTitle.textSize = 17f
+              settingsTitle.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+              settingsBox.addView(settingsTitle, lp(-1, -2, 4))
+              val common = LinearLayout(this)
+              common.orientation = LinearLayout.VERTICAL
+              photoBox = LinearLayout(this)
+              photoBox.orientation = LinearLayout.VERTICAL
+              videoBox = LinearLayout(this)
+              videoBox.orientation = LinearLayout.VERTICAL
+              val tail = LinearLayout(this)
+              tail.orientation = LinearLayout.VERTICAL
+              settingsBox.addView(common)
+              settingsBox.addView(photoBox)
+              settingsBox.addView(videoBox)
+              settingsBox.addView(tail)
+              setting(common, "Grid Lines", { if (gridOn) "On" else "Off" }) {
+                gridOn = !gridOn
+                grid.visibility = if (gridOn) View.VISIBLE else View.GONE
+              }
+              setting(common, "Display Refresh Rate", { if (maxHz) "Auto (max ${hzMax}Hz)" else "60Hz" }) {
+                maxHz = !maxHz
+                applyRefresh()
+              }
+              setting(photoBox, "Aspect Ratio", { if (ratio169) "16:9" else "4:3" }) {
+                ratio169 = !ratio169
+                updateResChip()
+                buildRatioRow()
+                if (mode != 1 && recording == null) rebind()
+              }
+              setting(photoBox, "Picture Quality", { if (hq) "High" else "Fast" }) {
+                hq = !hq
+                if (mode != 1 && recording == null) rebind()
+              }
+              setting(photoBox, "Photo Processing", { if (procOn) "On" else "Off" }) { procOn = !procOn }
+              setting(photoBox, "Processing Level", { arrayOf("Natural", "Balanced", "Strong")[procLevel] }) { procLevel = (procLevel + 1) % 3 }
+              setting(videoBox, "Aspect Ratio", { vNames[vRatio] }) {
+                vRatio = (vRatio + 1) % vNames.size
+                buildRatioRow()
+                if (mode == 1 && recording == null) rebind()
+              }
+              setting(videoBox, "Video Resolution", { resN[resIdx] }) {
+                resIdx = (resIdx + 1) % resN.size
+                updateResChip()
+                if (mode == 1 && recording == null) rebind()
+              }
+              setting(videoBox, "Bitrate", { if (ri == 0) "Auto" else "${rates[ri]} Mbps" }) {
+                ri = (ri + 1) % rates.size
+                if (mode == 1 && recording == null) rebind()
+              }
+              setting(videoBox, "Audio", { if (audioOn) "On" else "Off" }) { audioOn = !audioOn }
+              setting(videoBox, "Video Stabilization", { if (stab) "On" else "Off" }) {
+                stab = !stab
+                if (mode == 1 && recording == null) rebind()
+              }
+              setting(tail, "Restore Defaults", { "" }) {
+                gridOn = false
+                grid.visibility = View.GONE
+                ratio169 = false
+                hq = true
+                audioOn = true
+                stab = false
+                resIdx = 0
+                ri = 3
+                vRatio = 0
+                procOn = true
+                procLevel = 1
+                maxHz = true
+                applyRefresh()
+                refreshers.forEach { it() }
+                updateResChip()
+                buildRatioRow()
+                if (recording == null) rebind()
+              }
+              settingsView.addView(settingsBox)
+              root.addView(settingsView, FrameLayout.LayoutParams(-1, -1))
+              setContentView(root)
+              root.alpha = 0f
+              root.animate().alpha(1f).setDuration(450).start()
+              setMode(0)
+              applyRefresh()
+              loadLastThumb()
+
+              val need = arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO)
+              if (need.all { checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED }) startCamera()
+              else permLauncher.launch(need)
+            }
+
+            private fun loadSettings() {
+              val p = getSharedPreferences("procam_settings", Context.MODE_PRIVATE)
+              gridOn = p.getBoolean("gridOn", gridOn)
+              ratio169 = p.getBoolean("ratio169", ratio169)
+              hq = p.getBoolean("hq", hq)
+              audioOn = p.getBoolean("audioOn", audioOn)
+              stab = p.getBoolean("stab", stab)
+              resIdx = p.getInt("resIdx", resIdx).coerceIn(0, resN.size - 1)
+              ri = p.getInt("ri", ri).coerceIn(0, rates.size - 1)
+              vRatio = p.getInt("vRatio", vRatio).coerceIn(0, vNames.size - 1)
+              procOn = p.getBoolean("procOn", procOn)
+              procLevel = p.getInt("procLevel", procLevel).coerceIn(0, 2)
+              maxHz = p.getBoolean("maxHz", maxHz)
+            }
+
+            private fun saveSettings() {
+              getSharedPreferences("procam_settings", Context.MODE_PRIVATE).edit()
+                .putBoolean("gridOn", gridOn)
+                .putBoolean("ratio169", ratio169)
+                .putBoolean("hq", hq)
+                .putBoolean("audioOn", audioOn)
+                .putBoolean("stab", stab)
+                .putInt("resIdx", resIdx)
+                .putInt("ri", ri)
+                .putInt("vRatio", vRatio)
+                .putBoolean("procOn", procOn)
+                .putInt("procLevel", procLevel)
+                .putBoolean("maxHz", maxHz)
+                .apply()
+            }
+
+            private fun showPermissionDialog() {
+              info.text = "Camera permission needed"
+              AlertDialog.Builder(this)
+                .setTitle("Camera permission needed")
+                .setMessage("Photos and videos need the camera permission. You can allow it in app settings.")
+                .setPositiveButton("Open Settings") { _, _ ->
+                  startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.fromParts("package", packageName, null)))
+                }
+                .setNegativeButton("Cancel", null)
+                .show()
+            }
+
+            private fun loadLastThumb() {
+              Thread {
+                try {
+                  var best: Uri? = null
+                  var bestT = -1L
+                  var bestMime = "image/*"
+                  val sources = listOf(
+                    MediaStore.Images.Media.EXTERNAL_CONTENT_URI to "image/*",
+                    MediaStore.Video.Media.EXTERNAL_CONTENT_URI to "video/*"
+                  )
+                  for ((base, mm) in sources) {
+                    val c = contentResolver.query(
+                      base,
+                      arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.DATE_ADDED),
+                      MediaStore.MediaColumns.DISPLAY_NAME + " LIKE ?",
+                      arrayOf("ProCam_%"),
+                      MediaStore.MediaColumns.DATE_ADDED + " DESC"
+                    )
+                    if (c != null) {
+                      if (c.moveToFirst()) {
+                        val t = c.getLong(1)
+                        if (t > bestT) { bestT = t; best = ContentUris.withAppendedId(base, c.getLong(0)); bestMime = mm }
+                      }
+                      c.close()
+                    }
+                  }
+                  val u = best
+                  if (u != null) {
+                    val bm = contentResolver.loadThumbnail(u, Size(256, 256), null)
+                    runOnUiThread { lastUri = u; lastMime = bestMime; thumb.setImageBitmap(bm) }
+                  }
+                } catch (e: Exception) { }
+              }.start()
+            }
+
+            override fun onResume() {
+              super.onResume()
+              if (!camStarted && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
+            }
+
+            override fun onStop() {
+              super.onStop()
+              saveSettings()
+              if (counting) {
+                counting = false
+                handler.removeCallbacksAndMessages(null)
+                info.text = ""
+              }
+              pendingFlip = false
+              recording?.stop()
+            }
+
+            override fun onDestroy() {
+              handler.removeCallbacksAndMessages(null)
+              super.onDestroy()
+            }
+
+            override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+              if ((keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) && settingsView.visibility != View.VISIBLE) {
+                if ((event?.repeatCount ?: 0) == 0) onShutter()
+                return true
+              }
+              return super.onKeyDown(keyCode, event)
+            }
+
+            override fun onConfigurationChanged(c: Configuration) {
+              super.onConfigurationChanged(c)
+              @Suppress("DEPRECATION")
+              val r = windowManager.defaultDisplay.rotation
+              prev?.targetRotation = r
+              img?.targetRotation = r
+              if (recording == null) vc?.targetRotation = r
+              if (mode == 1 && vRatio >= 2 && recording == null) rebind()
+            }
+
+            private fun toast(m: String) {
+              toastV.text = m
+              reveal(toastV, true)
+              handler.removeCallbacks(hideToast)
+              handler.postDelayed(hideToast, 2500)
+            }
+
+            private fun openLast() {
+              val u = lastUri ?: return
+              try {
+                startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(u, lastMime).addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+              } catch (e: Exception) { toast("No gallery app found") }
+            }
+
+            private fun saved(uri: Uri?, mime: String, msg: String) {
+              if (uri == null) return
+              lastUri = uri
+              lastMime = mime
+              toast("$msg\nTap to view")
+              Thread {
+                try {
+                  val bm = contentResolver.loadThumbnail(uri, Size(256, 256), null)
+                  runOnUiThread { thumb.setImageBitmap(bm); pop(thumb) }
+                } catch (e: Exception) { }
+              }.start()
+            }
+
+            private val zoomStep = object : Runnable {
+              override fun run() {
+                if (!zRunning) return
+                val d = zTarget - zCur
+                if (Math.abs(d) < 0.002f * zCur) { zCur = zTarget; zRunning = false } else zCur += d * 0.1f
+                camera?.cameraControl?.setZoomRatio(zCur)
+                syncZoomUI()
+                if (zRunning) pv.postOnAnimation(this)
+              }
+            }
+
+            private fun zoomTo(r: Float) {
+              zTarget = r.coerceIn(zmin, zmax)
+              if (!zRunning) { zRunning = true; pv.postOnAnimation(zoomStep) }
+            }
+
+            private fun syncZoomUI() {
+              zoomLabel.text = String.format("%.1fx", zCur)
+              zoomWheel.zmin = zmin
+              zoomWheel.zmax = zmax
+              zoomWheel.cur = zCur
+              zoomWheel.invalidate()
+              var sel = -1
+              for (k in zoomVals.indices) if (Math.abs(zoomVals[k] - zCur) < 0.08f) sel = k
+              if (sel != lastSel) {
+                lastSel = sel
+                for (k in zoomChips.indices) mark(zoomChips[k], k == sel)
+              }
+            }
+
+            private fun applyRefresh() {
+              try {
+                @Suppress("DEPRECATION")
+                val d = windowManager.defaultDisplay
+                val cur = d.mode
+                val modes = d.supportedModes.filter { it.physicalWidth == cur.physicalWidth && it.physicalHeight == cur.physicalHeight }
+                hzMax = modes.maxOfOrNull { it.refreshRate }?.toInt() ?: 60
+                val best = (if (maxHz) modes.maxByOrNull { it.refreshRate } else modes.minByOrNull { Math.abs(it.refreshRate - 60f) }) ?: return
+                val a = window.attributes
+                a.preferredDisplayModeId = best.modeId
+                a.preferredRefreshRate = best.refreshRate
+                window.attributes = a
+              } catch (e: Exception) { }
+            }
+
+            private fun openSettings() {
+              val v = mode == 1
+              settingsTitle.text = if (v) "←  Video Settings" else "←  Photo Settings"
+              videoBox.visibility = if (v) View.VISIBLE else View.GONE
+              photoBox.visibility = if (v) View.GONE else View.VISIBLE
+              refreshers.forEach { it() }
+              reveal(settingsView, true)
+            }
+
+            private fun markZoom(i: Int) { for (k in zoomChips.indices) mark(zoomChips[k], k == i) }
+
+            private fun updateResChip() {
+              resChip.text = if (mode == 1) resS[resIdx] else if (ratio169) "16:9" else "4:3"
+            }
+
+            private fun updateShutter() {
+              val rec = recording != null
+              val red = mode == 1 || rec
+              shutter.background = bg(if (red) RED else Color.WHITE, if (rec) 18 else 38, if (red) Color.WHITE else RED, 5)
+              shutter.animate().scaleX(if (rec) 0.88f else 1f).scaleY(if (rec) 0.88f else 1f).setDuration(220).start()
+            }
+
+            private fun refreshPro() {
+              isoChip.text = if (manExp) "ISO\n$iso" else "ISO\nAuto"
+              shChip.text = if (manExp) "S\n${shDen.getOrNull(shSb.progress)?.let { "1/$it" } ?: "-"}" else "S\nAuto"
+              wbChip.text = if (manWb) "WB\n${wbNames[wbIdx]}" else "WB\nAuto"
+              mark(isoChip, manExp)
+              mark(shChip, manExp)
+              mark(wbChip, manWb)
+            }
+
+            private fun setMode(m: Int) {
+              if (recording != null || counting) return
+              mode = m
+              if (m != 2) { manExp = false; manWb = false; wasManual = false }
+              for (i in modeChips.indices) mark(modeChips[i], modeIds[i] == m)
+              reveal(proPanel, m == 2)
+              buildRatioRow()
+              updateResChip()
+              updateShutter()
+              refreshPro()
+              rebind()
+            }
+
+            private fun toggleHdr() {
+              if (!hdrOk) { toast("HDR not supported on this camera"); return }
+              hdr = !hdr
+              mark(hdrChip, hdr)
+              applyManual()
+            }
+
+            private fun applyFlash() {
+              img?.flashMode = flashModes[flash]
+              camera?.cameraControl?.enableTorch(mode == 1 && flash == 2)
+            }
+
+            private fun tapFocus(x: Float, y: Float) {
+              val pt = pv.meteringPointFactory.createPoint(x, y)
+              camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
+              focusBox.animate().cancel()
+              focusBox.x = x - dp(36)
+              focusBox.y = y - dp(36)
+              focusBox.visibility = View.VISIBLE
+              focusBox.alpha = 1f
+              focusBox.scaleX = 1.5f
+              focusBox.scaleY = 1.5f
+              focusBox.animate().setStartDelay(0).scaleX(1f).scaleY(1f).setDuration(220).setInterpolator(DecelerateInterpolator())
+                .withEndAction {
+                  focusBox.animate().setStartDelay(650).alpha(0f).setDuration(250).withEndAction { focusBox.visibility = View.GONE }.start()
+                }.start()
+            }
+
+            private fun isoFor(p: Int): Int = (isoLo * Math.pow(isoHi.toDouble() / isoLo, p / 100.0)).toInt()
+
+            private fun startCamera() {
+              if (camStarted) return
+              camStarted = true
+              val f = ProcessCameraProvider.getInstance(this)
+              f.addListener({
+                provider = f.get()
+                rebind()
+                try {
+                  val ef = ExtensionsManager.getInstanceAsync(this, provider!!)
+                  ef.addListener({
+                    try { extMgr = ef.get(); if (mode == 3) rebind() } catch (e: Exception) { }
+                  }, ContextCompat.getMainExecutor(this))
+                } catch (e: Exception) { }
+              }, ContextCompat.getMainExecutor(this))
+            }
+
+            private fun rebind() {
+              val p = provider ?: return
+              p.unbindAll()
+              fadePreview()
+              img = null
+              vc = null
+              val fps = resF[resIdx]
+              val range = Range(fps, fps)
+              val ar = if (mode == 1) (if (vRatio == 1) AspectRatio.RATIO_4_3 else AspectRatio.RATIO_16_9) else if (ratio169) AspectRatio.RATIO_16_9 else AspectRatio.RATIO_4_3
+              val pb = Preview.Builder().setTargetAspectRatio(ar)
+              if (mode == 1) {
+                pb.setTargetFrameRate(range)
+                Camera2Interop.Extender(pb).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+              }
+              val preview = pb.build()
+              preview.setSurfaceProvider(pv.surfaceProvider)
+              prev = preview
+              try {
+                var sel = if (back) CameraSelector.DEFAULT_BACK_CAMERA else CameraSelector.DEFAULT_FRONT_CAMERA
+                hwBokeh = false
+                val em = extMgr
+                if (mode == 3 && em != null && em.isExtensionAvailable(sel, ExtensionMode.BOKEH)) {
+                  sel = em.getExtensionEnabledCameraSelector(sel, ExtensionMode.BOKEH)
+                  hwBokeh = true
+                }
+                val cam: Camera
+                if (mode == 1) {
+                  val q = resQ[resIdx]
+                  val rb = Recorder.Builder().setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(q))).setAspectRatio(ar)
+                  if (rates[ri] > 0) rb.setTargetVideoEncodingBitRate(rates[ri] * 1_000_000)
+                  val vb = VideoCapture.Builder(rb.build()).setTargetFrameRate(range)
+                  val ex = Camera2Interop.Extender(vb)
+                  ex.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
+                  if (stab) ex.setCaptureRequestOption(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                  val cap = vb.build()
+                  vc = cap
+                  cam = if (vRatio >= 2) {
+                    val land = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+                    val rat = if (vRatio == 3) Rational(1, 1) else if (land) Rational(21, 9) else Rational(9, 21)
+                    @Suppress("DEPRECATION")
+                    val rot = windowManager.defaultDisplay.rotation
+                    val grp = UseCaseGroup.Builder().setViewPort(ViewPort.Builder(rat, rot).build()).addUseCase(preview).addUseCase(cap).build()
+                    p.bindToLifecycle(this, sel, grp)
+                  } else p.bindToLifecycle(this, sel, preview, cap)
+                } else {
+                  val ic = ImageCapture.Builder()
+                    .setCaptureMode(if (hq) ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY else ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    .setTargetAspectRatio(ar).build()
+                  img = ic
+                  cam = p.bindToLifecycle(this, sel, preview, ic)
+                }
+                camera = cam
+                readCaps(cam)
+                applyFlash()
+                applyManual()
+                zCur = 1f
+                zTarget = 1f
+                zRunning = false
+                lastSel = -2
+                syncZoomUI()
+                if (mode == 3) zoomTo(portraitZoom)
+                info.text = if (mode == 1) resN[resIdx] else if (mode == 3) (if (hwBokeh) "Portrait: hardware blur" else "Portrait: software blur") else ""
+              } catch (e: Exception) {
+                if (mode == 1 && resF[resIdx] == 60) {
+                  resIdx += 1
+                  updateResChip()
+                  rebind()
+                  toast("60fps failed here, using 30fps")
+                } else info.text = "Error: ${e.message}"
+              }
+            }
+
+            private fun readCaps(cam: Camera) {
+              val es = cam.cameraInfo.exposureState
+              val er = es.exposureCompensationRange
+              evLo = er.lower
+              evStep = es.exposureCompensationStep.toFloat()
+              evSb.max = er.upper - er.lower
+              evSb.progress = -er.lower
+              val zs = cam.cameraInfo.zoomState.value
+              zmin = zs?.minZoomRatio ?: 1f
+              zmax = zs?.maxZoomRatio ?: 1f
+              for (i in zoomVals.indices) {
+                zoomChips[i].visibility = if (zoomVals[i] >= zmin - 0.01f && zoomVals[i] <= zmax) View.VISIBLE else View.GONE
+              }
+              try {
+                val ci = Camera2CameraInfo.from(cam.cameraInfo)
+                val ir = ci.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+                if (ir != null) { isoLo = ir.lower; isoHi = minOf(ir.upper, 6400) }
+                val tr = ci.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                val dens = listOf(8000, 4000, 2000, 1000, 500, 250, 125, 60, 30, 15, 8, 4)
+                val fps = resF[resIdx]
+                shDen = dens.filter { d ->
+                  val ns = 1_000_000_000L / d
+                  (mode != 1 || d >= fps) && (tr == null || (ns >= tr.lower && ns <= tr.upper))
+                }
+                hdrOk = ci.getCameraCharacteristic(CameraCharacteristics.CONTROL_AVAILABLE_SCENE_MODES)
+                  ?.contains(CaptureRequest.CONTROL_SCENE_MODE_HDR) == true
+              } catch (e: Exception) {
+                shDen = listOf()
+                hdrOk = false
+              }
+              shSb.max = maxOf(shDen.size - 1, 0)
+              shSb.progress = shDen.indexOf(125).coerceAtLeast(0)
+              isoSb.progress = 30
+              wbSb.progress = 2
+              iso = isoFor(isoSb.progress)
+              if (shDen.isNotEmpty()) expNs = 1_000_000_000L / shDen[shSb.progress.coerceIn(0, shDen.size - 1)]
+              wbIdx = wbSb.progress
+              refreshPro()
+            }
+
+            private fun applyManual() {
+              val cam = camera ?: return
+              try {
+                val c2 = Camera2CameraControl.from(cam.cameraControl)
+                if (!manExp && !manWb && !hdr) {
+                  if (wasManual) c2.clearCaptureRequestOptions()
+                  wasManual = false
+                  return
+                }
+                val b = CaptureRequestOptions.Builder()
+                if (manExp) {
+                  b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                  b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                  b.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, expNs)
+                }
+                if (manWb) b.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_MODE, wbModes[wbIdx])
+                if (hdr) {
+                  b.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
+                  b.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
+                }
+                c2.setCaptureRequestOptions(b.build())
+                wasManual = true
+              } catch (e: Exception) {
+                info.text = "Manual not supported: ${e.message}"
+              }
+            }
+
+            private fun onShutter() {
+              shutter.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+              if (counting) {
+                counting = false
+                handler.removeCallbacksAndMessages(null)
+                info.text = ""
+                return
+              }
+              if (mode == 1) {
+                val r = recording
+                if (r != null) { r.stop(); return }
+                if (timerSec > 0) { counting = true; countdown(timerSec) { startRec() } } else startRec()
+              } else {
+                if (timerSec > 0) { counting = true; countdown(timerSec) { takePhoto() } } else takePhoto()
+              }
+            }
+
+            private fun countdown(n: Int, done: () -> Unit) {
+              if (!counting) return
+              if (n == 0) {
+                counting = false
+                info.text = ""
+                done()
+                return
+              }
+              info.text = "$n"
+              info.scaleX = 1.8f
+              info.scaleY = 1.8f
+              info.animate().scaleX(1f).scaleY(1f).setDuration(600).setInterpolator(DecelerateInterpolator()).start()
+              handler.postDelayed({ countdown(n - 1, done) }, 1000)
+            }
+
+            private fun takePhoto() {
+              val ic = img ?: return
+              flashView.alpha = 0.8f
+              flashView.animate().alpha(0f).setDuration(260).start()
+              val z = zCur
+              ic.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
+                override fun onCaptureSuccess(image: ImageProxy) {
+                  val buf = image.planes[0].buffer
+                  val bytes = ByteArray(buf.remaining())
+                  buf.get(bytes)
+                  val rot = image.imageInfo.rotationDegrees
+                  image.close()
+                  if (procOn || mode == 3) toast("Processing...")
+                  Thread { processAndSave(bytes, rot, z, mode) }.start()
+                }
+                override fun onError(e: ImageCaptureException) { toast("Error: ${e.message}") }
+              })
+            }
+
+            private fun processAndSave(bytes: ByteArray, rot: Int, z: Float, md: Int) {
+              try {
+                var out = bytes
+                if (procOn || md == 3) {
+                  val o = BitmapFactory.Options()
+                  o.inJustDecodeBounds = true
+                  BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
+                  var ss = 1
+                  val limit = if (md == 3) 3200 else 4200
+                  while (Math.max(o.outWidth, o.outHeight) / ss > limit) ss *= 2
+                  val o2 = BitmapFactory.Options()
+                  o2.inSampleSize = ss
+                  var bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o2) ?: return
+                  if (rot != 0) {
+                    val mx = Matrix()
+                    mx.postRotate(rot.toFloat())
+                    bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, mx, true)
+                  }
+                  if (md == 3 && !hwBokeh) {
+                    val r = try { portrait(bmp, z) } catch (e: Exception) { null }
+                    if (r != null) bmp = r else runOnUiThread { toast("No person found, saved without blur") }
+                  }
+                  if (procOn) bmp = enhance(bmp, procLevel, z > 1.9f)
+                  val bos = ByteArrayOutputStream()
+                  bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+                  out = bos.toByteArray()
+                }
+                val cv = ContentValues()
+                cv.put(MediaStore.Images.Media.DISPLAY_NAME, "ProCam_${System.currentTimeMillis()}")
+                cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                cv.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ProCam")
+                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+                if (uri != null) contentResolver.openOutputStream(uri)?.use { it.write(out) }
+                runOnUiThread { saved(uri, "image/*", if (md == 3) "Portrait Saved" else "Photo Saved") }
+              } catch (e: Throwable) {
+                runOnUiThread { toast("Error: ${e.message}") }
+              }
+            }
+
+            private fun c8(v: Float): Int = if (v < 0f) 0 else if (v > 255f) 255 else v.toInt()
+
+            private fun blur1d(src: IntArray, dst: IntArray, lines: Int, len: Int, ls: Int, es: Int, r: Int) {
+              val div = 2 * r + 1
+              for (l in 0 until lines) {
+                val o = l * ls
+                var sr = 0
+                var sg = 0
+                var sb = 0
+                for (i in -r..r) {
+                  val p = src[o + i.coerceIn(0, len - 1) * es]
+                  sr += (p shr 16) and 255
+                  sg += (p shr 8) and 255
+                  sb += p and 255
+                }
+                for (x in 0 until len) {
+                  dst[o + x * es] = (255 shl 24) or ((sr / div) shl 16) or ((sg / div) shl 8) or (sb / div)
+                  val a = src[o + (x + r + 1).coerceAtMost(len - 1) * es]
+                  val b = src[o + (x - r).coerceAtLeast(0) * es]
+                  sr += ((a shr 16) and 255) - ((b shr 16) and 255)
+                  sg += ((a shr 8) and 255) - ((b shr 8) and 255)
+                  sb += (a and 255) - (b and 255)
+                }
+              }
+            }
+
+            private fun boxBlur(px: IntArray, w: Int, h: Int, r: Int): IntArray {
+              val t = IntArray(px.size)
+              val o = IntArray(px.size)
+              blur1d(px, t, h, w, w, 1, r)
+              blur1d(t, o, w, h, 1, w, r)
+              return o
+            }
+
+            private fun enhance(src: Bitmap, lv: Int, boost: Boolean): Bitmap {
+              val w = src.width
+              val h = src.height
+              val px = IntArray(w * h)
+              src.getPixels(px, 0, w, 0, 0, w, h)
+              val bl = boxBlur(px, w, h, 2)
+              val dnS = floatArrayOf(0.45f, 0.65f, 0.85f)[lv] + (if (boost) 0.15f else 0f)
+              val shK = floatArrayOf(0.6f, 0.9f, 1.2f)[lv]
+              val sat = floatArrayOf(1.05f, 1.12f, 1.2f)[lv]
+              val lut = IntArray(256)
+              for (i in 0..255) {
+                val x = i / 255f
+                val y = 0.75f * x + 0.25f * x * x * (3f - 2f * x)
+                lut[i] = c8(255f * Math.pow(y.toDouble(), 0.97).toFloat())
+              }
+              for (i in px.indices) {
+                val p = px[i]
+                val q = bl[i]
+                val r = (p shr 16) and 255
+                val g = (p shr 8) and 255
+                val b = p and 255
+                val qr = (q shr 16) and 255
+                val qg = (q shr 8) and 255
+                val qb = q and 255
+                val d = Math.abs(((r - qr) * 77 + (g - qg) * 151 + (b - qb) * 28) shr 8)
+                val t = Math.min(1f, d / 22f)
+                val m = dnS * (1f - t)
+                val k = shK * t
+                val r2 = r + (qr - r) * m + k * (r - qr)
+                val g2 = g + (qg - g) * m + k * (g - qg)
+                val b2 = b + (qb - b) * m + k * (b - qb)
+                val l = r2 * 0.30f + g2 * 0.59f + b2 * 0.11f
+                val r3 = (l + (r2 - l) * sat) * 1.02f
+                val g3 = l + (g2 - l) * sat
+                val b3 = (l + (b2 - l) * sat) * 0.98f
+                px[i] = (255 shl 24) or (lut[c8(r3)] shl 16) or (lut[c8(g3)] shl 8) or lut[c8(b3)]
+              }
+              val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+              out.setPixels(px, 0, w, 0, 0, w, h)
+              return out
+            }
+
+            private fun portrait(src: Bitmap, z: Float): Bitmap? {
+              val seg = Segmentation.getClient(SelfieSegmenterOptions.Builder().setDetectorMode(SelfieSegmenterOptions.SINGLE_IMAGE_MODE).build())
+              val mask = Tasks.await(seg.process(InputImage.fromBitmap(src, 0)))
+              seg.close()
+              val mw = mask.width
+              val mh = mask.height
+              val m = FloatArray(mw * mh)
+              mask.buffer.asFloatBuffer().get(m)
+              var cnt = 0
+              for (v in m) if (v > 0.5f) cnt++
+              if (cnt < 0.03f * m.size) return null
+              val w = src.width
+              val h = src.height
+              val px = IntArray(w * h)
+              src.getPixels(px, 0, w, 0, 0, w, h)
+              val rad = Math.max(4, (w * (if (z >= 2.5f) 0.012f else 0.009f)).toInt())
+              var bl = px
+              repeat(3) { bl = boxBlur(bl, w, h, rad) }
+              for (y in 0 until h) {
+                val my = Math.min(mh - 1, y * mh / h)
+                for (x in 0 until w) {
+                  val mv = m[my * mw + Math.min(mw - 1, x * mw / w)]
+                  val a = if (mv <= 0.3f) 0f else if (mv >= 0.7f) 1f else (mv - 0.3f) / 0.4f
+                  if (a < 1f) {
+                    val i = y * w + x
+                    val p = px[i]
+                    val q = bl[i]
+                    val r = c8(((p shr 16) and 255) * a + ((q shr 16) and 255) * (1f - a))
+                    val g = c8(((p shr 8) and 255) * a + ((q shr 8) and 255) * (1f - a))
+                    val b = c8((p and 255) * a + (q and 255) * (1f - a))
+                    px[i] = (255 shl 24) or (r shl 16) or (g shl 8) or b
+                  }
+                }
+              }
+              val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+              out.setPixels(px, 0, w, 0, 0, w, h)
+              return out
+            }
+
+            private fun onPause(v: TextView) {
+              val r = recording ?: return
+              if (paused) { r.resume(); paused = false; v.text = "⏸" } else { r.pause(); paused = true; v.text = "▶" }
+            }
+
+            private fun startRec() {
+              val cap = vc ?: return
+              val cv = ContentValues()
+              cv.put(MediaStore.Video.Media.DISPLAY_NAME, "ProCam_${System.currentTimeMillis()}")
+              cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
+              cv.put(MediaStore.Video.Media.RELATIVE_PATH, "Movies/ProCam")
+              val out = MediaStoreOutputOptions.Builder(contentResolver, MediaStore.Video.Media.EXTERNAL_CONTENT_URI)
+                .setContentValues(cv).build()
+              var pr = cap.output.prepareRecording(this, out)
+              if (audioOn) {
+                if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) pr = pr.withAudioEnabled()
+                else toast("Mic permission denied - recording without audio")
+              }
+              recording = pr.start(ContextCompat.getMainExecutor(this)) { e ->
+                if (e is VideoRecordEvent.Status) {
+                  val s = e.recordingStats.recordedDurationNanos / 1_000_000_000L
+                  info.text = "● " + String.format("%02d:%02d", s / 60, s % 60)
+                }
+                if (e is VideoRecordEvent.Finalize) {
+                  recording = null
+                  paused = false
+                  pauseChip.text = "⏸"
+                  reveal(pauseChip, false)
+                  updateShutter()
+                  info.text = resN[resIdx]
+                  if (e.hasError()) toast("Error ${e.error}") else saved(e.outputResults.outputUri, "video/*", "Video Saved")
+                  if (pendingFlip) {
+                    pendingFlip = false
+                    back = !back
+                    rebind()
+                    handler.postDelayed({ startRec() }, 600)
+                  }
+                }
+              }
+              reveal(pauseChip, true)
+              updateShutter()
+            }
+          }
+          EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: procam-${{ github.run_number }}
+          name: ProCam build ${{ github.run_number }}
+          body: ${{ github.event.head_commit.message }}
+          prerelease: ${{ github.ref != 'refs/heads/main' }}
+          files: app/build/outputs/apk/debug/app-debug.apk

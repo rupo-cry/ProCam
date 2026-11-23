@@ -48,8 +48,8 @@ jobs:
               applicationId = "com.rupom.procam"
               minSdk = 29
               targetSdk = 34
-              versionCode = 1
-              versionName = "1.1"
+              versionCode = 2
+              versionName = "1.2"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -160,25 +160,25 @@ jobs:
             }
           }
 
-          class ZoomWheel(c: Context, private val onMult: (Float) -> Unit) : View(c) {
+          class ZoomWheel(c: Context, private val onMult: (Float) -> Unit, private val onTouch: () -> Unit = {}) : View(c) {
             var zmin = 1f
             var zmax = 1f
             var cur = 1f
             private val dn = c.resources.displayMetrics.density
-            private val ppo = 170f * dn
-            private val p = Paint()
-            private val tp = Paint()
+            private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+            private val tp = Paint(Paint.ANTI_ALIAS_FLAG)
             private var anim: ValueAnimator? = null
             private var last = 0f
-            private val vals = floatArrayOf(0.5f, 0.6f, 0.7f, 0.8f, 0.9f, 1f, 1.2f, 1.4f, 1.6f, 1.8f, 2f, 2.5f, 3f, 4f, 5f, 6f, 8f, 10f, 15f, 20f, 30f)
-            private val major = floatArrayOf(0.6f, 1f, 2f, 3f, 5f, 10f, 20f)
+            private val degPerOct = 36f
+            private val majors = floatArrayOf(0.6f, 1f, 2f, 3f, 5f, 10f, 20f, 30f)
+            private val ticks: FloatArray = buildTicks()
             private val gd = GestureDetector(c, object : GestureDetector.SimpleOnGestureListener() {
               override fun onDown(e: MotionEvent): Boolean { anim?.cancel(); return true }
               override fun onScroll(e1: MotionEvent?, e2: MotionEvent, dx: Float, dy: Float): Boolean { mult(dx); return true }
               override fun onFling(e1: MotionEvent?, e2: MotionEvent, vx: Float, vy: Float): Boolean {
                 anim?.cancel()
                 last = 0f
-                val a = ValueAnimator.ofFloat(0f, -vx * 0.3f)
+                val a = ValueAnimator.ofFloat(0f, -vx * 0.22f)
                 a.duration = 800
                 a.interpolator = DecelerateInterpolator(2f)
                 a.addUpdateListener { v ->
@@ -192,36 +192,68 @@ jobs:
               }
             })
             init {
-              p.isAntiAlias = true
-              tp.isAntiAlias = true
               tp.color = Color.WHITE
-              tp.textSize = 11f * dn
+              tp.textSize = 12f * dn
               tp.textAlign = Paint.Align.CENTER
             }
-            private fun mult(dx: Float) { onMult(Math.pow(2.0, (dx / ppo).toDouble()).toFloat()) }
-            override fun onTouchEvent(e: MotionEvent): Boolean = gd.onTouchEvent(e)
+            private fun buildTicks(): FloatArray {
+              val l = ArrayList<Float>()
+              for (i in 5..29) l.add(i / 10f)
+              for (i in 6..19) l.add(i / 2f)
+              for (i in 5..15) l.add(i * 2f)
+              return l.toFloatArray()
+            }
+            private fun isMajor(v: Float): Boolean {
+              for (m in majors) if (Math.abs(m - v) < 0.001f) return true
+              return false
+            }
+            private fun rad(): Float = width * 0.78f
+            private fun mult(dx: Float) {
+              val oct = (dx / rad()).toDouble() * 180.0 / Math.PI / degPerOct
+              onMult(Math.pow(2.0, oct).toFloat())
+            }
+            override fun onTouchEvent(e: MotionEvent): Boolean {
+              onTouch()
+              return gd.onTouchEvent(e)
+            }
             override fun onDraw(cv: Canvas) {
               val w = width.toFloat()
-              val h = height.toFloat()
+              val r = rad()
+              val top = 8f * dn
               val cx = w / 2
-              p.strokeWidth = 2f * dn
-              for (v in vals) {
-                if (v < zmin - 0.01f || v > zmax + 0.01f) continue
-                val x = cx + (Math.log((v / cur).toDouble()) / Math.log(2.0)).toFloat() * ppo
-                if (x < 0f || x > w) continue
-                val fade = 1f - Math.min(1f, Math.abs(x - cx) / cx)
-                val al = (60 + 195 * fade).toInt()
-                val maj = major.any { it == v }
+              val cy = top + r
+              p.style = Paint.Style.FILL
+              p.color = Color.argb(110, 90, 90, 90)
+              cv.drawCircle(cx, cy, r, p)
+              p.style = Paint.Style.STROKE
+              p.strokeWidth = 3f * dn
+              p.color = Color.argb(70, 255, 255, 255)
+              cv.drawCircle(cx, cy, r - 1.5f * dn, p)
+              for (v in ticks) {
+                if (v < zmin - 0.001f || v > zmax + 0.001f) continue
+                val ang = (Math.log((v / cur).toDouble()) / Math.log(2.0)).toFloat() * degPerOct
+                if (Math.abs(ang) > 44f) continue
+                val fade = 1f - Math.min(1f, Math.abs(ang) / 50f)
+                val al = (70 + 185 * fade).toInt()
+                val maj = isMajor(v)
+                cv.save()
+                cv.rotate(ang, cx, cy)
+                p.style = Paint.Style.STROKE
+                p.strokeWidth = (if (maj) 2.5f else 1.8f) * dn
                 p.color = Color.argb(al, 255, 255, 255)
-                cv.drawLine(x, h * (if (maj) 0.34f else 0.48f), x, h * 0.66f, p)
+                val len = (if (maj) 16f else 9f) * dn
+                val y0 = top + 10f * dn
+                cv.drawLine(cx, y0, cx, y0 + len, p)
                 if (maj) {
                   tp.alpha = al
-                  cv.drawText(if (v == v.toInt().toFloat()) "${v.toInt()}x" else "$v", x, h * 0.28f, tp)
+                  cv.drawText(if (v == v.toInt().toFloat()) "${v.toInt()}" else "$v", cx, y0 + len + 16f * dn, tp)
                 }
+                cv.restore()
               }
-              p.color = Color.parseColor("#FF2D4B")
+              p.style = Paint.Style.STROKE
+              p.color = Color.parseColor("#FFC400")
               p.strokeWidth = 3f * dn
-              cv.drawLine(cx, h * 0.22f, cx, h * 0.78f, p)
+              cv.drawLine(cx, top + 8f * dn, cx, top + 32f * dn, p)
             }
           }
 
@@ -302,6 +334,12 @@ jobs:
             private var maxHz = true
             private var hzMax = 60
             private lateinit var zoomWheel: ZoomWheel
+            private lateinit var zoomRow: LinearLayout
+            private lateinit var expPanel: LinearLayout
+            private lateinit var chevChip: TextView
+            private var expOpen = false
+            private var dialOn = false
+            private val hideDialR = Runnable { setDial(false) }
             private lateinit var ratioRow: LinearLayout
             private lateinit var flashView: View
             private var vRatio = 0
@@ -321,7 +359,7 @@ jobs:
             private val resQ = arrayOf(Quality.FHD, Quality.FHD, Quality.UHD, Quality.HD, Quality.HD)
             private val resF = intArrayOf(60, 30, 30, 60, 30)
             private val resN = arrayOf("1080P 60FPS", "1080P 30FPS", "4K 30FPS", "720P 60FPS", "720P 30FPS")
-            private val resS = arrayOf("1080p60", "1080p30", "4K30", "720p60", "720p30")
+            private val resS = arrayOf("1080p\n60FPS", "1080p\n30FPS", "4K\n30FPS", "720p\n60FPS", "720p\n30FPS")
             private val rates = intArrayOf(0, 10, 20, 30, 50, 80)
             private val wbNames = arrayOf("Tungsten", "Fluor", "Day", "Cloudy", "Shade")
             private val wbModes = intArrayOf(
@@ -498,9 +536,29 @@ jobs:
               }
               hdrChip = chip("HDR") { toggleHdr() }
               val setChip = chip("⚙") { openSettings() }
-              val top = rowOf(flashChip, timerChip, resChip, hdrChip, setChip)
-              top.setPadding(dp(6), dp(6), dp(6), dp(6))
-              main.addView(top, lp(-1, -2))
+              val gridChip = chip(if (gridOn) "▦ Grid On" else "▦ Grid Off") { v ->
+                gridOn = !gridOn
+                grid.visibility = if (gridOn) View.VISIBLE else View.GONE
+                refreshers.forEach { it() }
+                saveSettings()
+              }
+              mark(gridChip, gridOn)
+              refreshers.add {
+                gridChip.text = if (gridOn) "▦ Grid On" else "▦ Grid Off"
+                mark(gridChip, gridOn)
+              }
+              chevChip = chip("⌄") { setPanel(!expOpen) }
+              chevChip.textSize = 18f
+              val topBar = FrameLayout(this)
+              topBar.setPadding(dp(10), dp(6), dp(10), dp(6))
+              topBar.addView(flashChip, FrameLayout.LayoutParams(-2, -2, Gravity.START or Gravity.CENTER_VERTICAL))
+              topBar.addView(chevChip, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
+              topBar.addView(hdrChip, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL))
+              main.addView(topBar, lp(-1, -2))
+              expPanel = rowOf(timerChip, resChip, gridChip, setChip)
+              expPanel.setPadding(dp(4), dp(4), dp(4), dp(4))
+              expPanel.background = bg(Color.parseColor("#E61A1424"), 20)
+              expPanel.visibility = View.GONE
 
               val area = FrameLayout(this)
               pv = PreviewView(this)
@@ -508,7 +566,7 @@ jobs:
               val sg = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
                 override fun onScale(d: ScaleGestureDetector): Boolean {
                   pinched = true
-                  zoomTo(zTarget * d.scaleFactor)
+                  zoomTo(zTarget * d.scaleFactor, true)
                   return true
                 }
               })
@@ -540,32 +598,38 @@ jobs:
               rl.topMargin = dp(34)
               area.addView(ratioRow, rl)
 
-              val zoomRow = LinearLayout(this)
+              zoomRow = LinearLayout(this)
               zoomRow.orientation = LinearLayout.HORIZONTAL
-              zoomRow.background = bg(Color.parseColor("#99000000"), 22)
+              zoomRow.gravity = Gravity.CENTER_VERTICAL
+              zoomRow.setPadding(dp(4), dp(4), dp(4), dp(4))
+              zoomRow.background = bg(Color.parseColor("#66000000"), 24)
               for (i in zoomVals.indices) {
                 val z = zoomVals[i]
-                val c = chip(if (z == 1f) "1x" else "$z".removeSuffix(".0")) {
-                  zoomTo(z)
-                }
+                val c = chip(zoomName(i)) { zoomTo(z) }
+                c.background = null
+                c.minWidth = dp(40)
+                c.minHeight = dp(40)
+                c.setPadding(dp(6), 0, dp(6), 0)
+                c.setOnLongClickListener { showDial(); true }
                 zoomChips.add(c)
-                zoomRow.addView(c, lp(-2, -2, 2))
+                zoomRow.addView(c, lp(-2, dp(40), 0))
               }
               zoomLabel = TextView(this)
               zoomLabel.setTextColor(Color.WHITE)
-              zoomLabel.textSize = 13f
-              zoomLabel.text = "1.0x"
+              zoomLabel.textSize = 22f
+              zoomLabel.setShadowLayer(6f, 0f, 0f, Color.BLACK)
+              zoomLabel.text = "1.0X"
               zoomLabel.gravity = Gravity.CENTER
-              zoomWheel = ZoomWheel(this) { m -> zoomTo(zTarget * m) }
-              val zcol = LinearLayout(this)
-              zcol.orientation = LinearLayout.VERTICAL
-              zcol.gravity = Gravity.CENTER_HORIZONTAL
-              zcol.addView(zoomLabel)
-              zcol.addView(zoomWheel, LinearLayout.LayoutParams(-1, dp(46)))
-              zcol.addView(zoomRow)
-              val zl = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)
-              zl.bottomMargin = dp(8)
-              area.addView(zcol, zl)
+              zoomLabel.visibility = View.GONE
+              zoomWheel = ZoomWheel(this, { m -> zoomTo(zTarget * m, true) }, { showDial() })
+              zoomWheel.visibility = View.GONE
+              area.addView(zoomWheel, FrameLayout.LayoutParams(-1, dp(150), Gravity.BOTTOM))
+              val zl2 = FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+              zl2.bottomMargin = dp(154)
+              area.addView(zoomLabel, zl2)
+              val zl3 = FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
+              zl3.bottomMargin = dp(14)
+              area.addView(zoomRow, zl3)
 
               proPanel = LinearLayout(this)
               proPanel.orientation = LinearLayout.VERTICAL
@@ -613,7 +677,7 @@ jobs:
               }
               proPanel.addView(reset, lp(-2, -2, 4))
               val pl = FrameLayout.LayoutParams(-1, -2, Gravity.BOTTOM)
-              pl.bottomMargin = dp(124)
+              pl.bottomMargin = dp(72)
               area.addView(proPanel, pl)
 
               toastV = TextView(this)
@@ -624,8 +688,11 @@ jobs:
               toastV.visibility = View.GONE
               toastV.setOnClickListener { openLast() }
               val tl = FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL)
-              tl.bottomMargin = dp(124)
+              tl.bottomMargin = dp(72)
               area.addView(toastV, tl)
+              val epl = FrameLayout.LayoutParams(-1, -2, Gravity.TOP)
+              epl.setMargins(dp(8), dp(4), dp(8), 0)
+              area.addView(expPanel, epl)
               main.addView(area, lp(-1, 0, 0, 1f))
 
               val strip = LinearLayout(this)
@@ -656,12 +723,16 @@ jobs:
               val right = LinearLayout(this)
               right.orientation = LinearLayout.VERTICAL
               pauseChip = chip("⏸") { onPause(it) }
+              pauseChip.textSize = 22f
+              pauseChip.background = bg(DARK, 30, Color.WHITE, 2)
               pauseChip.visibility = View.GONE
+              val plp = FrameLayout.LayoutParams(dp(60), dp(60), Gravity.CENTER)
+              ctl.addView(pauseChip, plp)
+              pauseChip.translationX = -dp(104).toFloat()
               val flip = chip("⟳ Flip") {
                 if (recording != null) { pendingFlip = true; recording?.stop() }
                 else if (!counting) { back = !back; rebind() }
               }
-              right.addView(pauseChip, lp(-2, -2, 3))
               right.addView(flip, lp(-2, -2, 3))
               val rlp = FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL)
               rlp.rightMargin = dp(16)
@@ -920,22 +991,75 @@ jobs:
               }
             }
 
-            private fun zoomTo(r: Float) {
+            private fun zoomTo(r: Float, dial: Boolean = false) {
               zTarget = r.coerceIn(zmin, zmax)
+              if (dial) showDial()
               if (!zRunning) { zRunning = true; pv.postOnAnimation(zoomStep) }
             }
 
+            private fun zoomName(k: Int): String {
+              val z = zoomVals[k]
+              return if (z == z.toInt().toFloat()) "${z.toInt()}" else "$z"
+            }
+
+            private fun showDial() {
+              pv.removeCallbacks(hideDialR)
+              pv.postDelayed(hideDialR, 1400)
+              if (!dialOn) setDial(true)
+            }
+
+            private fun setDial(on: Boolean) {
+              dialOn = on
+              zoomWheel.animate().cancel()
+              zoomLabel.animate().cancel()
+              zoomRow.animate().cancel()
+              if (on) {
+                for (v in arrayOf<View>(zoomWheel, zoomLabel)) {
+                  v.alpha = 0f
+                  v.visibility = View.VISIBLE
+                  v.animate().alpha(1f).setDuration(180).start()
+                }
+                zoomRow.animate().alpha(0f).setDuration(150).withEndAction { zoomRow.visibility = View.INVISIBLE }.start()
+              } else {
+                for (v in arrayOf<View>(zoomWheel, zoomLabel)) {
+                  v.animate().alpha(0f).setDuration(220).withEndAction { v.visibility = View.GONE }.start()
+                }
+                zoomRow.alpha = 0f
+                zoomRow.visibility = View.VISIBLE
+                zoomRow.animate().alpha(1f).setDuration(220).start()
+              }
+            }
+
+            private fun setPanel(open: Boolean) {
+              expOpen = open
+              chevChip.text = if (open) "⌃" else "⌄"
+              expPanel.animate().cancel()
+              if (open) {
+                expPanel.alpha = 0f
+                expPanel.visibility = View.VISIBLE
+                expPanel.animate().alpha(1f).setDuration(200).start()
+              } else {
+                expPanel.animate().alpha(0f).setDuration(150).withEndAction { expPanel.visibility = View.GONE }.start()
+              }
+            }
+
             private fun syncZoomUI() {
-              zoomLabel.text = String.format("%.1fx", zCur)
+              zoomLabel.text = String.format("%.1fX", zCur)
               zoomWheel.zmin = zmin
               zoomWheel.zmax = zmax
               zoomWheel.cur = zCur
               zoomWheel.invalidate()
               var sel = -1
-              for (k in zoomVals.indices) if (Math.abs(zoomVals[k] - zCur) < 0.08f) sel = k
+              for (k in zoomVals.indices) if (zoomVals[k] <= zCur + 0.04f) sel = k
+              for (k in zoomChips.indices) {
+                val t = if (k != sel) zoomName(k) else if (Math.abs(zoomVals[k] - zCur) < 0.05f) zoomName(k) + "X" else String.format("%.1fX", zCur)
+                if (zoomChips[k].text.toString() != t) zoomChips[k].text = t
+              }
               if (sel != lastSel) {
                 lastSel = sel
-                for (k in zoomChips.indices) mark(zoomChips[k], k == sel)
+                for (k in zoomChips.indices) {
+                  zoomChips[k].background = if (k == sel) bg(Color.parseColor("#33FFFFFF"), 20, Color.WHITE, 2) else null
+                }
               }
             }
 
@@ -955,6 +1079,7 @@ jobs:
             }
 
             private fun openSettings() {
+              if (expOpen) setPanel(false)
               val v = mode == 1
               settingsTitle.text = if (v) "←  Video Settings" else "←  Photo Settings"
               videoBox.visibility = if (v) View.VISIBLE else View.GONE
@@ -1390,7 +1515,7 @@ jobs:
 
             private fun onPause(v: TextView) {
               val r = recording ?: return
-              if (paused) { r.resume(); paused = false; v.text = "⏸" } else { r.pause(); paused = true; v.text = "▶" }
+              if (paused) { r.resume(); paused = false; v.text = "⏸" } else { r.pause(); paused = true; v.text = "▶"; info.text = "⏸ Paused" }
             }
 
             private fun startRec() {
@@ -1409,7 +1534,7 @@ jobs:
               recording = pr.start(ContextCompat.getMainExecutor(this)) { e ->
                 if (e is VideoRecordEvent.Status) {
                   val s = e.recordingStats.recordedDurationNanos / 1_000_000_000L
-                  info.text = "● " + String.format("%02d:%02d", s / 60, s % 60)
+                  info.text = (if (paused) "⏸ " else "● ") + String.format("%02d:%02d", s / 60, s % 60)
                 }
                 if (e is VideoRecordEvent.Finalize) {
                   recording = null

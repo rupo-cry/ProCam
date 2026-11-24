@@ -49,7 +49,7 @@ jobs:
               minSdk = 29
               targetSdk = 34
               versionCode = 3
-              versionName = "1.3"
+              versionName = "1.4"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -68,6 +68,7 @@ jobs:
             implementation("androidx.camera:camera-view:$c")
             implementation("androidx.camera:camera-extensions:$c")
             implementation("com.google.mlkit:segmentation-selfie:16.0.0-beta6")
+            implementation("com.google.mlkit:face-detection:16.1.6")
           }
           EOF
           cat > app/src/main/AndroidManifest.xml <<'EOF'
@@ -104,9 +105,11 @@ jobs:
           import android.graphics.Matrix
           import android.graphics.Color
           import android.graphics.Paint
+          import android.graphics.Rect
           import android.graphics.drawable.GradientDrawable
           import android.hardware.camera2.CameraCharacteristics
           import android.hardware.camera2.CaptureRequest
+          import android.hardware.camera2.params.TonemapCurve
           import android.net.Uri
           import android.os.Bundle
           import android.os.Handler
@@ -139,6 +142,8 @@ jobs:
           import androidx.camera.extensions.ExtensionsManager
           import com.google.android.gms.tasks.Tasks
           import com.google.mlkit.vision.common.InputImage
+          import com.google.mlkit.vision.face.FaceDetection
+          import com.google.mlkit.vision.face.FaceDetectorOptions
           import com.google.mlkit.vision.segmentation.Segmentation
           import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
           import java.io.ByteArrayOutputStream
@@ -348,9 +353,16 @@ jobs:
             private var portraitZoom = 1.5f
             private var extMgr: ExtensionsManager? = null
             private var camStarted = false
-            private var lookIdx = 0
-            private val lookChips = mutableListOf<TextView>()
-            private lateinit var lookBlock: LinearLayout
+            private var rawPhoto = false
+            private var rawVideo = false
+            private var beautyLv = 1
+            private var sharpLv = 2
+            private var colBoost = true
+            private var apIdx = 1
+            private val apNames = arrayOf("f/1.4", "f/2.0", "f/2.8", "f/4.0")
+            private val apMul = floatArrayOf(1f, 0.75f, 0.55f, 0.38f)
+            private val beautyNames = arrayOf("Off", "Basic", "Medium", "Strong")
+            private val sharpNames = arrayOf("Off", "Low", "Medium", "High")
             private var hwBokeh = false
             private val modeIds = intArrayOf(0, 3, 1, 2)
             private val vNames = arrayOf("16:9", "4:3", "Cinematic", "1:1")
@@ -558,35 +570,7 @@ jobs:
               topBar.addView(chevChip, FrameLayout.LayoutParams(-2, -2, Gravity.CENTER))
               topBar.addView(hdrChip, FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL))
               main.addView(topBar, lp(-1, -2))
-              val lookTitle = TextView(this)
-              lookTitle.text = "LUT / Look (photo)"
-              lookTitle.setTextColor(Color.WHITE)
-              lookTitle.textSize = 12f
-              lookTitle.setPadding(dp(8), dp(6), dp(8), 0)
-              val lookRowBox = LinearLayout(this)
-              lookRowBox.orientation = LinearLayout.HORIZONTAL
-              for (i in lookNames.indices) {
-                val lc = chip(lookNames[i]) {
-                  lookIdx = i
-                  refreshLook()
-                  saveSettings()
-                  toast(if (i == 0) "Look off" else "Look: " + lookNames[i])
-                }
-                lookChips.add(lc)
-                lookRowBox.addView(lc, lp(-2, -2, 3))
-              }
-              refreshLook()
-              val lookScroll = HorizontalScrollView(this)
-              lookScroll.isHorizontalScrollBarEnabled = false
-              lookScroll.addView(lookRowBox)
-              lookBlock = LinearLayout(this)
-              lookBlock.orientation = LinearLayout.VERTICAL
-              lookBlock.addView(lookTitle)
-              lookBlock.addView(lookScroll)
-              expPanel = LinearLayout(this)
-              expPanel.orientation = LinearLayout.VERTICAL
-              expPanel.addView(rowOf(timerChip, resChip, gridChip, setChip))
-              expPanel.addView(lookBlock)
+              expPanel = rowOf(timerChip, resChip, gridChip, setChip)
               expPanel.setPadding(dp(4), dp(4), dp(4), dp(4))
               expPanel.background = bg(Color.parseColor("#E61A1424"), 20)
               expPanel.visibility = View.GONE
@@ -812,8 +796,19 @@ jobs:
                 hq = !hq
                 if (mode != 1 && recording == null) rebind()
               }
-              setting(photoBox, "Photo Processing", { if (procOn) "On" else "Off" }) { procOn = !procOn }
+              setting(photoBox, "RAW Photo (no processing)", { if (rawPhoto) "On" else "Off" }) {
+                rawPhoto = !rawPhoto
+                refreshers.forEach { it() }
+                if (mode != 1 && recording == null) rebind()
+              }
+              setting(photoBox, "Photo Processing", { if (rawPhoto) "Off (RAW)" else if (procOn) "On" else "Off" }) {
+                if (rawPhoto) toast("RAW is on, turn it off first") else procOn = !procOn
+              }
               setting(photoBox, "Processing Level", { arrayOf("Natural", "Balanced", "Strong")[procLevel] }) { procLevel = (procLevel + 1) % 3 }
+              setting(photoBox, "Sharpness", { sharpNames[sharpLv] }) { sharpLv = (sharpLv + 1) % sharpNames.size }
+              setting(photoBox, "Beautification", { beautyNames[beautyLv] }) { beautyLv = (beautyLv + 1) % beautyNames.size }
+              setting(photoBox, "Smart Color", { if (colBoost) "On" else "Off" }) { colBoost = !colBoost }
+              setting(photoBox, "Portrait Blur", { apNames[apIdx] }) { apIdx = (apIdx + 1) % apNames.size }
               setting(videoBox, "Aspect Ratio", { vNames[vRatio] }) {
                 vRatio = (vRatio + 1) % vNames.size
                 buildRatioRow()
@@ -826,6 +821,10 @@ jobs:
               }
               setting(videoBox, "Bitrate", { if (ri == 0) "Auto" else "${rates[ri]} Mbps" }) {
                 ri = (ri + 1) % rates.size
+                if (mode == 1 && recording == null) rebind()
+              }
+              setting(videoBox, "RAW Video (flat, no processing)", { if (rawVideo) "On" else "Off" }) {
+                rawVideo = !rawVideo
                 if (mode == 1 && recording == null) rebind()
               }
               setting(videoBox, "Audio", { if (audioOn) "On" else "Off" }) { audioOn = !audioOn }
@@ -845,6 +844,12 @@ jobs:
                 vRatio = 0
                 procOn = true
                 procLevel = 1
+                rawPhoto = false
+                rawVideo = false
+                beautyLv = 1
+                sharpLv = 2
+                colBoost = true
+                apIdx = 1
                 maxHz = true
                 applyRefresh()
                 refreshers.forEach { it() }
@@ -878,8 +883,13 @@ jobs:
               vRatio = p.getInt("vRatio", vRatio).coerceIn(0, vNames.size - 1)
               procOn = p.getBoolean("procOn", procOn)
               procLevel = p.getInt("procLevel", procLevel).coerceIn(0, 2)
+              rawPhoto = p.getBoolean("rawPhoto", rawPhoto)
+              rawVideo = p.getBoolean("rawVideo", rawVideo)
+              beautyLv = p.getInt("beautyLv", beautyLv).coerceIn(0, 3)
+              sharpLv = p.getInt("sharpLv", sharpLv).coerceIn(0, 3)
+              colBoost = p.getBoolean("colBoost", colBoost)
+              apIdx = p.getInt("apIdx", apIdx).coerceIn(0, 3)
               maxHz = p.getBoolean("maxHz", maxHz)
-              lookIdx = p.getInt("lookIdx", lookIdx).coerceIn(0, lookNames.size - 1)
             }
 
             private fun saveSettings() {
@@ -894,8 +904,13 @@ jobs:
                 .putInt("vRatio", vRatio)
                 .putBoolean("procOn", procOn)
                 .putInt("procLevel", procLevel)
+                .putBoolean("rawPhoto", rawPhoto)
+                .putBoolean("rawVideo", rawVideo)
+                .putInt("beautyLv", beautyLv)
+                .putInt("sharpLv", sharpLv)
+                .putBoolean("colBoost", colBoost)
+                .putInt("apIdx", apIdx)
                 .putBoolean("maxHz", maxHz)
-                .putInt("lookIdx", lookIdx)
                 .apply()
             }
 
@@ -1146,7 +1161,6 @@ jobs:
             private fun setMode(m: Int) {
               if (recording != null || counting) return
               mode = m
-              lookBlock.visibility = if (m == 1) View.GONE else View.VISIBLE
               if (m != 2) { manExp = false; manWb = false; wasManual = false }
               for (i in modeChips.indices) mark(modeChips[i], modeIds[i] == m)
               reveal(proPanel, m == 2)
@@ -1232,7 +1246,8 @@ jobs:
                 if (mode == 1) {
                   val q = resQ[resIdx]
                   val rb = Recorder.Builder().setQualitySelector(QualitySelector.from(q, FallbackStrategy.lowerQualityOrHigherThan(q))).setAspectRatio(ar)
-                  if (rates[ri] > 0) rb.setTargetVideoEncodingBitRate(rates[ri] * 1_000_000)
+                  val br = if (rawVideo) Math.max(rates[ri], if (resIdx == 2) 120 else 80) else rates[ri]
+                  if (br > 0) rb.setTargetVideoEncodingBitRate(br * 1_000_000)
                   val vb = VideoCapture.Builder(rb.build()).setTargetFrameRate(range)
                   val ex = Camera2Interop.Extender(vb)
                   ex.setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
@@ -1264,7 +1279,7 @@ jobs:
                 lastSel = -2
                 syncZoomUI()
                 if (mode == 3) zoomTo(portraitZoom)
-                info.text = if (mode == 1) resN[resIdx] else if (mode == 3) (if (hwBokeh) "Portrait: hardware blur" else "Portrait: software blur") else ""
+                info.text = if (mode == 1) resN[resIdx] + (if (rawVideo) " RAW" else "") else if (mode == 3) (if (hwBokeh) "Portrait: hardware blur" else "Portrait: software blur") else ""
               } catch (e: Exception) {
                 if (mode == 1 && resF[resIdx] == 60) {
                   resIdx += 1
@@ -1315,11 +1330,47 @@ jobs:
               refreshPro()
             }
 
+            private fun flatOn(): Boolean = if (mode == 1) rawVideo else (rawPhoto && mode != 3)
+
+            private fun flatY(x: Float): Float {
+              val s = if (x <= 0.0031308f) 12.92f * x else (1.055 * Math.pow(x.toDouble(), 1.0 / 2.4) - 0.055).toFloat()
+              return 0.06f + 0.86f * (s * (1.12f - 0.12f * s))
+            }
+
+            private fun flatOpts(cam: Camera, b: CaptureRequestOptions.Builder) {
+              try {
+                val ci = Camera2CameraInfo.from(cam.cameraInfo)
+                val nr = ci.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+                if (nr != null && nr.contains(CaptureRequest.NOISE_REDUCTION_MODE_OFF)) {
+                  b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+                }
+                val ed = ci.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+                if (ed != null && ed.contains(CaptureRequest.EDGE_MODE_OFF)) {
+                  b.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+                }
+                if (mode == 1) {
+                  val tm = ci.getCameraCharacteristic(CameraCharacteristics.TONEMAP_AVAILABLE_TONE_MAP_MODES)
+                  if (tm != null && tm.contains(CaptureRequest.TONEMAP_MODE_CONTRAST_CURVE)) {
+                    val pts = FloatArray(66)
+                    for (i in 0..32) {
+                      val x = i / 32f
+                      pts[2 * i] = x
+                      pts[2 * i + 1] = flatY(x)
+                    }
+                    b.setCaptureRequestOption(CaptureRequest.TONEMAP_MODE, CaptureRequest.TONEMAP_MODE_CONTRAST_CURVE)
+                    b.setCaptureRequestOption(CaptureRequest.TONEMAP_CURVE, TonemapCurve(pts.copyOf(), pts.copyOf(), pts.copyOf()))
+                  }
+                }
+              } catch (e: Throwable) {
+              }
+            }
+
             private fun applyManual() {
               val cam = camera ?: return
               try {
                 val c2 = Camera2CameraControl.from(cam.cameraControl)
-                if (!manExp && !manWb && !hdr) {
+                val flat = flatOn()
+                if (!manExp && !manWb && !hdr && !flat) {
                   if (wasManual) c2.clearCaptureRequestOptions()
                   wasManual = false
                   return
@@ -1335,6 +1386,7 @@ jobs:
                   b.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_USE_SCENE_MODE)
                   b.setCaptureRequestOption(CaptureRequest.CONTROL_SCENE_MODE, CaptureRequest.CONTROL_SCENE_MODE_HDR)
                 }
+                if (flat) flatOpts(cam, b)
                 c2.setCaptureRequestOptions(b.build())
                 wasManual = true
               } catch (e: Exception) {
@@ -1379,7 +1431,6 @@ jobs:
               flashView.alpha = 0.8f
               flashView.animate().alpha(0f).setDuration(260).start()
               val z = zCur
-              val lk = lookIdx
               ic.takePicture(ContextCompat.getMainExecutor(this), object : ImageCapture.OnImageCapturedCallback() {
                 override fun onCaptureSuccess(image: ImageProxy) {
                   val buf = image.planes[0].buffer
@@ -1387,17 +1438,18 @@ jobs:
                   buf.get(bytes)
                   val rot = image.imageInfo.rotationDegrees
                   image.close()
-                  if (procOn || mode == 3 || lk != 0) toast("Processing...")
-                  Thread { processAndSave(bytes, rot, z, mode, lk) }.start()
+                  if (!(rawPhoto && mode != 3)) toast("Processing...")
+                  Thread { processAndSave(bytes, rot, z, mode) }.start()
                 }
                 override fun onError(e: ImageCaptureException) { toast("Error: ${e.message}") }
               })
             }
 
-            private fun processAndSave(bytes: ByteArray, rot: Int, z: Float, md: Int, lk: Int) {
+            private fun processAndSave(bytes: ByteArray, rot: Int, z: Float, md: Int) {
               try {
                 var out = bytes
-                if (procOn || md == 3 || lk != 0) {
+                val raw = rawPhoto && md != 3
+                if (!raw) {
                   val o = BitmapFactory.Options()
                   o.inJustDecodeBounds = true
                   BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
@@ -1412,12 +1464,13 @@ jobs:
                     mx.postRotate(rot.toFloat())
                     bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, mx, true)
                   }
-                  if (md == 3 && !hwBokeh) {
-                    val r = try { portrait(bmp, z) } catch (e: Exception) { null }
+                  val usePortrait = md == 3 && !hwBokeh
+                  val faces = if (usePortrait || (procOn && beautyLv > 0)) detectFaces(bmp) else emptyList<Rect>()
+                  if (usePortrait) {
+                    val r = try { portrait(bmp, faces) } catch (e: Throwable) { null }
                     if (r != null) bmp = r else runOnUiThread { toast("No person found, saved without blur") }
                   }
-                  if (procOn) bmp = enhance(bmp, procLevel, z > 1.9f)
-                  if (lk != 0) bmp = applyLook(bmp, lk)
+                  bmp = enhance(bmp, procLevel, z > 1.9f, faces, !procOn)
                   val bos = ByteArrayOutputStream()
                   bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos)
                   out = bos.toByteArray()
@@ -1428,65 +1481,13 @@ jobs:
                 cv.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ProCam")
                 val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
                 if (uri != null) contentResolver.openOutputStream(uri)?.use { it.write(out) }
-                runOnUiThread { saved(uri, "image/*", if (md == 3) "Portrait Saved" else "Photo Saved") }
+                runOnUiThread { saved(uri, "image/*", if (raw) "RAW Photo Saved" else if (md == 3) "Portrait Saved" else "Photo Saved") }
               } catch (e: Throwable) {
                 runOnUiThread { toast("Error: ${e.message}") }
               }
             }
 
             private fun c8(v: Float): Int = if (v < 0f) 0 else if (v > 255f) 255 else v.toInt()
-
-            private val lookNames = arrayOf("Off", "iPhone", "Samsung", "Vivo", "Pixel", "Oppo", "Xiaomi")
-            // contrast, gamma, blackLift, highlightRoll, saturation, vibrance, warmth, tint
-            private val lookP = arrayOf(
-              floatArrayOf(0f, 1f, 0f, 0f, 1f, 0f, 0f, 0f),
-              floatArrayOf(0.18f, 0.98f, 0.012f, 0.06f, 1.06f, 0.10f, 0.03f, 0f),
-              floatArrayOf(0.28f, 0.95f, 0f, 0.04f, 1.22f, 0.12f, -0.02f, 0f),
-              floatArrayOf(0.06f, 0.90f, 0.03f, 0.10f, 1.10f, 0.18f, 0.05f, -0.015f),
-              floatArrayOf(0.30f, 1.04f, 0f, 0.10f, 1.02f, 0.06f, -0.01f, 0f),
-              floatArrayOf(0.10f, 0.94f, 0.015f, 0.08f, 1.08f, 0.15f, 0.02f, 0f),
-              floatArrayOf(0.22f, 0.97f, 0f, 0.05f, 1.15f, 0.10f, 0.03f, 0.01f)
-            )
-
-            private fun applyLook(src: Bitmap, idx: Int): Bitmap {
-              val q = lookP[idx]
-              val w = src.width
-              val h = src.height
-              val px = IntArray(w * h)
-              src.getPixels(px, 0, w, 0, 0, w, h)
-              val lr = IntArray(256)
-              val lg = IntArray(256)
-              val lb = IntArray(256)
-              for (i in 0..255) {
-                var y = Math.pow((i / 255f).toDouble(), q[1].toDouble()).toFloat()
-                y += q[0] * (y * y * (3f - 2f * y) - y)
-                y = q[2] + y * (1f - q[2])
-                if (y > 0.7f) y = 0.7f + (y - 0.7f) * (1f - q[3] * 2f)
-                lr[i] = c8(255f * y * (1f + q[6]))
-                lg[i] = c8(255f * y * (1f + q[7]))
-                lb[i] = c8(255f * y * (1f - q[6]))
-              }
-              val sat = q[4]
-              val vib = q[5]
-              for (i in px.indices) {
-                val p = px[i]
-                val r = lr[(p shr 16) and 255]
-                val g = lg[(p shr 8) and 255]
-                val b = lb[p and 255]
-                val mx = Math.max(r, Math.max(g, b))
-                val mn = Math.min(r, Math.min(g, b))
-                val sf = sat + vib * (1f - (mx - mn) / 255f)
-                val l = r * 0.30f + g * 0.59f + b * 0.11f
-                px[i] = (255 shl 24) or (c8(l + (r - l) * sf) shl 16) or (c8(l + (g - l) * sf) shl 8) or c8(l + (b - l) * sf)
-              }
-              val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-              out.setPixels(px, 0, w, 0, 0, w, h)
-              return out
-            }
-
-            private fun refreshLook() {
-              for (k in lookChips.indices) mark(lookChips[k], k == lookIdx)
-            }
 
             private fun blur1d(src: IntArray, dst: IntArray, lines: Int, len: Int, ls: Int, es: Int, r: Int) {
               val div = 2 * r + 1
@@ -1520,49 +1521,215 @@ jobs:
               return o
             }
 
-            private fun enhance(src: Bitmap, lv: Int, boost: Boolean): Bitmap {
+            private fun boxF(src: FloatArray, w: Int, h: Int, r: Int): FloatArray {
+              val t = FloatArray(src.size)
+              val o = FloatArray(src.size)
+              val div = (2 * r + 1).toFloat()
+              for (y in 0 until h) {
+                val b = y * w
+                var sum = 0f
+                for (i in -r..r) sum += src[b + i.coerceIn(0, w - 1)]
+                for (x in 0 until w) {
+                  t[b + x] = sum / div
+                  sum += src[b + (x + r + 1).coerceAtMost(w - 1)] - src[b + (x - r).coerceAtLeast(0)]
+                }
+              }
+              for (x in 0 until w) {
+                var sum = 0f
+                for (i in -r..r) sum += t[i.coerceIn(0, h - 1) * w + x]
+                for (y in 0 until h) {
+                  o[y * w + x] = sum / div
+                  sum += t[(y + r + 1).coerceAtMost(h - 1) * w + x] - t[(y - r).coerceAtLeast(0) * w + x]
+                }
+              }
+              return o
+            }
+
+            private fun guided(gi: FloatArray, pp: FloatArray, w: Int, h: Int, r: Int, eps: Float): FloatArray {
+              val n = gi.size
+              val mI = boxF(gi, w, h, r)
+              val mp = boxF(pp, w, h, r)
+              val cII = boxF(FloatArray(n) { gi[it] * gi[it] }, w, h, r)
+              val cIp = boxF(FloatArray(n) { gi[it] * pp[it] }, w, h, r)
+              val aa = FloatArray(n)
+              val bb = FloatArray(n)
+              for (i in 0 until n) {
+                val v = cII[i] - mI[i] * mI[i]
+                val c = cIp[i] - mI[i] * mp[i]
+                val k = c / (v + eps)
+                aa[i] = k
+                bb[i] = mp[i] - k * mI[i]
+              }
+              val ma = boxF(aa, w, h, r)
+              val mb = boxF(bb, w, h, r)
+              return FloatArray(n) { (ma[it] * gi[it] + mb[it]).coerceIn(0f, 1f) }
+            }
+
+            private fun detectFaces(bmp: Bitmap): List<Rect> {
+              return try {
+                val sc = Math.min(1f, 1000f / Math.max(bmp.width, bmp.height))
+                val small = if (sc < 1f) Bitmap.createScaledBitmap(bmp, (bmp.width * sc).toInt(), (bmp.height * sc).toInt(), true) else bmp
+                val det = FaceDetection.getClient(
+                  FaceDetectorOptions.Builder()
+                    .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_FAST)
+                    .setMinFaceSize(0.08f)
+                    .build()
+                )
+                val fs = Tasks.await(det.process(InputImage.fromBitmap(small, 0)))
+                det.close()
+                if (small !== bmp) small.recycle()
+                val res = ArrayList<Rect>()
+                for (f in fs) {
+                  val bb = f.boundingBox
+                  res.add(Rect((bb.left / sc).toInt(), (bb.top / sc).toInt(), (bb.right / sc).toInt(), (bb.bottom / sc).toInt()))
+                }
+                res
+              } catch (e: Throwable) {
+                emptyList<Rect>()
+              }
+            }
+
+            private fun enhance(src: Bitmap, lv: Int, boost: Boolean, faces: List<Rect>, lite: Boolean): Bitmap {
               val w = src.width
               val h = src.height
               val px = IntArray(w * h)
               src.getPixels(px, 0, w, 0, 0, w, h)
               val bl = boxBlur(px, w, h, 2)
-              val dnS = floatArrayOf(0.45f, 0.65f, 0.85f)[lv] + (if (boost) 0.15f else 0f)
-              val shK = floatArrayOf(0.6f, 0.9f, 1.2f)[lv]
-              val sat = floatArrayOf(1.05f, 1.12f, 1.2f)[lv]
+              val bLv = if (lite) 0 else beautyLv
+              // face weight map (0..255), soft ellipse around every detected face
+              val fw = ByteArray(w * h)
+              if (bLv > 0 && faces.isNotEmpty()) {
+                for (f in faces) {
+                  val cx = (f.left + f.right) / 2f
+                  val cy = (f.top + f.bottom) / 2f - f.height() * 0.04f
+                  val rx = f.width() * 0.62f
+                  val ry = f.height() * 0.72f
+                  if (rx < 4f || ry < 4f) continue
+                  val y0 = Math.max(0, (cy - ry).toInt())
+                  val y1 = Math.min(h - 1, (cy + ry).toInt())
+                  val x0 = Math.max(0, (cx - rx).toInt())
+                  val x1 = Math.min(w - 1, (cx + rx).toInt())
+                  for (y in y0..y1) {
+                    val dy = (y - cy) / ry
+                    for (x in x0..x1) {
+                      val dx = (x - cx) / rx
+                      val d = dx * dx + dy * dy
+                      if (d < 1f) {
+                        val v = Math.min(1f, (1f - d) * 2f)
+                        val iv = (v * 255f).toInt()
+                        val i = y * w + x
+                        if (iv > (fw[i].toInt() and 255)) fw[i] = iv.toByte()
+                      }
+                    }
+                  }
+                }
+              }
+              // coarse local-brightness map for shadow / highlight balancing
+              val gs = 16
+              val gw = (w + gs - 1) / gs
+              val gh = (h + gs - 1) / gs
+              var lg = FloatArray(gw * gh)
+              if (!lite) {
+                val gc = IntArray(gw * gh)
+                var yy = 0
+                while (yy < h) {
+                  var xx = 0
+                  while (xx < w) {
+                    val p = px[yy * w + xx]
+                    val l = (((p shr 16) and 255) * 77 + ((p shr 8) and 255) * 151 + (p and 255) * 28) shr 8
+                    val gi = (yy / gs) * gw + xx / gs
+                    lg[gi] += l.toFloat()
+                    gc[gi]++
+                    xx += 4
+                  }
+                  yy += 4
+                }
+                for (i in lg.indices) lg[i] = if (gc[i] > 0) lg[i] / gc[i] / 255f else 0.5f
+                lg = boxF(lg, gw, gh, 2)
+                lg = boxF(lg, gw, gh, 2)
+              }
+              val dnS = if (lite) 0.35f else floatArrayOf(0.45f, 0.65f, 0.85f)[lv] + (if (boost) 0.15f else 0f)
+              val shK = if (lite) 0.5f else floatArrayOf(0f, 0.5f, 0.9f, 1.35f)[sharpLv]
+              val sat = if (lite) 1f else floatArrayOf(1.03f, 1.08f, 1.14f)[lv]
+              val vib = if (lite) 0f else floatArrayOf(0.12f, 0.2f, 0.3f)[lv]
+              val tone = if (lite) 0f else floatArrayOf(0.7f, 1f, 1.3f)[lv]
+              val bBright = floatArrayOf(0f, 0.05f, 0.09f, 0.14f)[bLv]
+              val bSmooth = floatArrayOf(0f, 0.25f, 0.45f, 0.65f)[bLv]
+              val cBoost = colBoost && !lite
+              val warm = if (lite) 0f else 0.01f
               val lut = IntArray(256)
               for (i in 0..255) {
-                val x = i / 255f
-                val y = 0.75f * x + 0.25f * x * x * (3f - 2f * x)
-                lut[i] = c8(255f * Math.pow(y.toDouble(), 0.97).toFloat())
+                if (lite) {
+                  lut[i] = i
+                } else {
+                  val x = i / 255f
+                  val y = 0.75f * x + 0.25f * x * x * (3f - 2f * x)
+                  lut[i] = c8(255f * Math.pow(y.toDouble(), 0.97).toFloat())
+                }
               }
-              for (i in px.indices) {
-                val p = px[i]
-                val q = bl[i]
-                val r = (p shr 16) and 255
-                val g = (p shr 8) and 255
-                val b = p and 255
-                val qr = (q shr 16) and 255
-                val qg = (q shr 8) and 255
-                val qb = q and 255
-                val d = Math.abs(((r - qr) * 77 + (g - qg) * 151 + (b - qb) * 28) shr 8)
-                val t = Math.min(1f, d / 22f)
-                val m = dnS * (1f - t)
-                val k = shK * t
-                val r2 = r + (qr - r) * m + k * (r - qr)
-                val g2 = g + (qg - g) * m + k * (g - qg)
-                val b2 = b + (qb - b) * m + k * (b - qb)
-                val l = r2 * 0.30f + g2 * 0.59f + b2 * 0.11f
-                val r3 = (l + (r2 - l) * sat) * 1.02f
-                val g3 = l + (g2 - l) * sat
-                val b3 = (l + (b2 - l) * sat) * 0.98f
-                px[i] = (255 shl 24) or (lut[c8(r3)] shl 16) or (lut[c8(g3)] shl 8) or lut[c8(b3)]
+              for (y in 0 until h) {
+                val gy = (y + 0.5f) / gs - 0.5f
+                val y0 = gy.toInt().coerceIn(0, gh - 1)
+                val y1 = Math.min(gh - 1, y0 + 1)
+                val fy = (gy - y0).coerceIn(0f, 1f)
+                for (x in 0 until w) {
+                  val i = y * w + x
+                  val p = px[i]
+                  val q = bl[i]
+                  val r = (p shr 16) and 255
+                  val g = (p shr 8) and 255
+                  val b = p and 255
+                  val qr = (q shr 16) and 255
+                  val qg = (q shr 8) and 255
+                  val qb = q and 255
+                  val fwv = (fw[i].toInt() and 255) / 255f
+                  val d = Math.abs(((r - qr) * 77 + (g - qg) * 151 + (b - qb) * 28) shr 8)
+                  val t = Math.min(1f, d / 22f)
+                  val m = Math.min(0.95f, dnS * (1f - t) + bSmooth * fwv * (1f - 0.5f * t))
+                  val k = shK * t * (1f - 0.75f * fwv)
+                  var r2 = r + (qr - r) * m + ((r - qr) * k).coerceIn(-36f, 36f)
+                  var g2 = g + (qg - g) * m + ((g - qg) * k).coerceIn(-36f, 36f)
+                  var b2 = b + (qb - b) * m + ((b - qb) * k).coerceIn(-36f, 36f)
+                  var gain = 1f
+                  if (tone > 0f) {
+                    val gx = (x + 0.5f) / gs - 0.5f
+                    val x0 = gx.toInt().coerceIn(0, gw - 1)
+                    val x1 = Math.min(gw - 1, x0 + 1)
+                    val fx = (gx - x0).coerceIn(0f, 1f)
+                    val loc = (lg[y0 * gw + x0] * (1f - fx) + lg[y0 * gw + x1] * fx) * (1f - fy) +
+                      (lg[y1 * gw + x0] * (1f - fx) + lg[y1 * gw + x1] * fx) * fy
+                    val dk = 1f - loc
+                    val ht = ((loc - 0.62f) / 0.38f).coerceIn(0f, 1f)
+                    gain = (1f + 0.38f * tone * dk * dk * dk) * (1f - 0.16f * tone * ht * ht * (3f - 2f * ht))
+                  }
+                  val cb = 128f - 0.169f * r2 - 0.331f * g2 + 0.5f * b2
+                  val cr = 128f + 0.5f * r2 - 0.419f * g2 - 0.081f * b2
+                  val skin = cb >= 77f && cb <= 127f && cr >= 133f && cr <= 173f
+                  if (fwv > 0f) {
+                    val lum0 = (r2 * 0.30f + g2 * 0.59f + b2 * 0.11f) / 255f
+                    gain *= 1f + bBright * fwv * (if (skin) 1f else 0.35f) * (1.15f - lum0)
+                  }
+                  r2 *= gain
+                  g2 *= gain
+                  b2 *= gain
+                  val mx = Math.max(r2, Math.max(g2, b2))
+                  val mn = Math.min(r2, Math.min(g2, b2))
+                  val cs = if (mx > 1f) (mx - mn) / mx else 0f
+                  var sc = sat + vib * (1f - cs) * (if (skin) 0.35f else 1f)
+                  if (cBoost && !skin && cs > 0.38f) sc += 0.14f * Math.min(1f, (cs - 0.38f) / 0.3f)
+                  val l = r2 * 0.30f + g2 * 0.59f + b2 * 0.11f
+                  val r3 = (l + (r2 - l) * sc) * (1f + warm)
+                  val g3 = l + (g2 - l) * sc
+                  val b3 = (l + (b2 - l) * sc) * (1f - warm)
+                  px[i] = (255 shl 24) or (lut[c8(r3)] shl 16) or (lut[c8(g3)] shl 8) or lut[c8(b3)]
+                }
               }
               val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
               out.setPixels(px, 0, w, 0, 0, w, h)
               return out
             }
 
-            private fun portrait(src: Bitmap, z: Float): Bitmap? {
+            private fun portrait(src: Bitmap, faces: List<Rect>): Bitmap? {
               val seg = Segmentation.getClient(SelfieSegmenterOptions.Builder().setDetectorMode(SelfieSegmenterOptions.SINGLE_IMAGE_MODE).build())
               val mask = Tasks.await(seg.process(InputImage.fromBitmap(src, 0)))
               seg.close()
@@ -1570,28 +1737,180 @@ jobs:
               val mh = mask.height
               val m = FloatArray(mw * mh)
               mask.buffer.asFloatBuffer().get(m)
-              var cnt = 0
-              for (v in m) if (v > 0.5f) cnt++
-              if (cnt < 0.03f * m.size) return null
               val w = src.width
               val h = src.height
+              // 1) work on a reduced copy
+              val s1 = Math.min(1f, 1024f / Math.max(w, h))
+              val lw = Math.max(16, (w * s1).toInt())
+              val lh = Math.max(16, (h * s1).toInt())
+              val small = Bitmap.createScaledBitmap(src, lw, lh, true)
+              val sp = IntArray(lw * lh)
+              small.getPixels(sp, 0, lw, 0, 0, lw, lh)
+              if (small !== src) small.recycle()
+              val n = lw * lh
+              val a = FloatArray(n)
+              var cnt = 0
+              for (y in 0 until lh) {
+                val my = Math.min(mh - 1, y * mh / lh)
+                for (x in 0 until lw) {
+                  val v = m[my * mw + Math.min(mw - 1, x * mw / lw)]
+                  a[y * lw + x] = v
+                  if (v > 0.5f) cnt++
+                }
+              }
+              if (cnt < 0.03f * n) return null
+              // 2) faces are always part of the subject
+              for (f in faces) {
+                val cx = (f.left + f.right) / 2f * s1
+                val cy = ((f.top + f.bottom) / 2f - f.height() * 0.04f) * s1
+                val rx = f.width() * 0.6f * s1
+                val ry = f.height() * 0.7f * s1
+                if (rx < 2f || ry < 2f) continue
+                for (y in Math.max(0, (cy - ry).toInt())..Math.min(lh - 1, (cy + ry).toInt())) {
+                  val dy = (y - cy) / ry
+                  for (x in Math.max(0, (cx - rx).toInt())..Math.min(lw - 1, (cx + rx).toInt())) {
+                    val dx = (x - cx) / rx
+                    if (dx * dx + dy * dy < 1f && a[y * lw + x] < 0.95f) a[y * lw + x] = 0.95f
+                  }
+                }
+              }
+              // 3) snap the soft mask to real image edges (guided filter)
+              val gi = FloatArray(n)
+              for (i in 0 until n) {
+                val p = sp[i]
+                gi[i] = (((p shr 16) and 255) * 77 + ((p shr 8) and 255) * 151 + (p and 255) * 28) / 65280f
+              }
+              var q = guided(gi, a, lw, lh, Math.max(4, lw / 128), 0.001f)
+              q = guided(gi, q, lw, lh, Math.max(2, lw / 256), 0.0005f)
+              for (i in 0 until n) {
+                val t = ((q[i] - 0.35f) / 0.3f).coerceIn(0f, 1f)
+                a[i] = t * t * (3f - 2f * t)
+              }
+              // 4) distance from subject -> blur radius (farther = blurrier)
+              val inf = 1_000_000
+              val ds = IntArray(n)
+              for (i in 0 until n) ds[i] = if (a[i] > 0.5f) 0 else inf
+              for (y in 0 until lh) {
+                for (x in 0 until lw) {
+                  val i = y * lw + x
+                  var v = ds[i]
+                  if (x > 0) v = Math.min(v, ds[i - 1] + 3)
+                  if (y > 0) {
+                    v = Math.min(v, ds[i - lw] + 3)
+                    if (x > 0) v = Math.min(v, ds[i - lw - 1] + 4)
+                    if (x < lw - 1) v = Math.min(v, ds[i - lw + 1] + 4)
+                  }
+                  ds[i] = v
+                }
+              }
+              for (y in lh - 1 downTo 0) {
+                for (x in lw - 1 downTo 0) {
+                  val i = y * lw + x
+                  var v = ds[i]
+                  if (x < lw - 1) v = Math.min(v, ds[i + 1] + 3)
+                  if (y < lh - 1) {
+                    v = Math.min(v, ds[i + lw] + 3)
+                    if (x < lw - 1) v = Math.min(v, ds[i + lw + 1] + 4)
+                    if (x > 0) v = Math.min(v, ds[i + lw - 1] + 4)
+                  }
+                  ds[i] = v
+                }
+              }
+              val rmax = lw * 0.026f * apMul[apIdx]
+              val far = lw * 0.16f
+              val rd = FloatArray(n)
+              for (i in 0 until n) {
+                if (a[i] >= 0.98f) {
+                  rd[i] = 0f
+                } else {
+                  val dn = Math.min(1f, (ds[i] / 3f) / far)
+                  rd[i] = rmax * (0.3f + 0.7f * dn * dn * (3f - 2f * dn))
+                }
+              }
+              // 5) disc (bokeh) blur of the background only, bright points weigh more
+              val ns = 40
+              val vx = FloatArray(ns)
+              val vy = FloatArray(ns)
+              val vr = FloatArray(ns)
+              for (k in 0 until ns) {
+                val rr = Math.sqrt((k + 0.5) / ns).toFloat()
+                val th = (k * 2.399963).toFloat()
+                vx[k] = rr * Math.cos(th.toDouble()).toFloat()
+                vy[k] = rr * Math.sin(th.toDouble()).toFloat()
+                vr[k] = rr
+              }
+              val plate = IntArray(n)
+              for (y in 0 until lh) {
+                for (x in 0 until lw) {
+                  val i = y * lw + x
+                  val rad = rd[i]
+                  if (rad < 0.8f) {
+                    plate[i] = sp[i]
+                  } else {
+                    val ang = (((x * 73856093) xor (y * 19349663)) and 1023) * 0.0061359f
+                    val cs = Math.cos(ang.toDouble()).toFloat()
+                    val sn = Math.sin(ang.toDouble()).toFloat()
+                    var sr = 0f
+                    var sg = 0f
+                    var sb = 0f
+                    var sw = 0f
+                    for (k in 0 until ns) {
+                      val ox = (vx[k] * cs - vy[k] * sn) * rad
+                      val oy = (vx[k] * sn + vy[k] * cs) * rad
+                      val sx = (x + ox + 0.5f).toInt().coerceIn(0, lw - 1)
+                      val sy = (y + oy + 0.5f).toInt().coerceIn(0, lh - 1)
+                      val j = sy * lw + sx
+                      if (a[j] > 0.6f) continue
+                      val p = sp[j]
+                      val pr = (p shr 16) and 255
+                      val pg = (p shr 8) and 255
+                      val pb = p and 255
+                      val l = (pr * 77 + pg * 151 + pb * 28) shr 8
+                      var wt = 0.8f + 0.5f * vr[k]
+                      if (l > 200) wt *= 1f + 5f * (l - 200) / 55f
+                      sr += pr * wt
+                      sg += pg * wt
+                      sb += pb * wt
+                      sw += wt
+                    }
+                    plate[i] = if (sw > 0f) {
+                      (255 shl 24) or (c8(sr / sw) shl 16) or (c8(sg / sw) shl 8) or c8(sb / sw)
+                    } else sp[i]
+                  }
+                }
+              }
+              // 6) upscale the blurred plate and composite with the sharp original
+              val pbm = Bitmap.createBitmap(lw, lh, Bitmap.Config.ARGB_8888)
+              pbm.setPixels(plate, 0, lw, 0, 0, lw, lh)
+              val big = Bitmap.createScaledBitmap(pbm, w, h, true)
+              if (big !== pbm) pbm.recycle()
+              val bp = IntArray(w * h)
+              big.getPixels(bp, 0, w, 0, 0, w, h)
+              big.recycle()
               val px = IntArray(w * h)
               src.getPixels(px, 0, w, 0, 0, w, h)
-              val rad = Math.max(4, (w * (if (z >= 2.5f) 0.012f else 0.009f)).toInt())
-              var bl = px
-              repeat(3) { bl = boxBlur(bl, w, h, rad) }
               for (y in 0 until h) {
-                val my = Math.min(mh - 1, y * mh / h)
+                val fy = ((y + 0.5f) * lh / h - 0.5f).coerceIn(0f, lh - 1f)
+                val y0 = fy.toInt()
+                val y1 = Math.min(lh - 1, y0 + 1)
+                val ty = fy - y0
                 for (x in 0 until w) {
-                  val mv = m[my * mw + Math.min(mw - 1, x * mw / w)]
-                  val a = if (mv <= 0.3f) 0f else if (mv >= 0.7f) 1f else (mv - 0.3f) / 0.4f
-                  if (a < 1f) {
+                  val fx = ((x + 0.5f) * lw / w - 0.5f).coerceIn(0f, lw - 1f)
+                  val x0 = fx.toInt()
+                  val x1 = Math.min(lw - 1, x0 + 1)
+                  val tx = fx - x0
+                  val al = (a[y0 * lw + x0] * (1f - tx) + a[y0 * lw + x1] * tx) * (1f - ty) +
+                    (a[y1 * lw + x0] * (1f - tx) + a[y1 * lw + x1] * tx) * ty
+                  if (al < 0.995f) {
                     val i = y * w + x
                     val p = px[i]
-                    val q = bl[i]
-                    val r = c8(((p shr 16) and 255) * a + ((q shr 16) and 255) * (1f - a))
-                    val g = c8(((p shr 8) and 255) * a + ((q shr 8) and 255) * (1f - a))
-                    val b = c8((p and 255) * a + (q and 255) * (1f - a))
+                    val bq = bp[i]
+                    val inv = 1f - al
+                    val nz = (((x * 1103515245 + y * 12345) ushr 13) and 255) / 128f - 1f
+                    val gr = nz * 2.5f * inv
+                    val r = c8(((p shr 16) and 255) * al + ((bq shr 16) and 255) * inv + gr)
+                    val g = c8(((p shr 8) and 255) * al + ((bq shr 8) and 255) * inv + gr)
+                    val b = c8((p and 255) * al + (bq and 255) * inv + gr)
                     px[i] = (255 shl 24) or (r shl 16) or (g shl 8) or b
                   }
                 }

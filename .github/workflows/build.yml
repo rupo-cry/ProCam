@@ -48,8 +48,8 @@ jobs:
               applicationId = "com.rupom.procam"
               minSdk = 29
               targetSdk = 34
-              versionCode = 3
-              versionName = "1.4"
+              versionCode = 4
+              versionName = "1.5"
             }
             compileOptions {
               sourceCompatibility = JavaVersion.VERSION_17
@@ -86,6 +86,1535 @@ jobs:
             </application>
           </manifest>
           EOF
+          cat > app/src/main/java/com/rupom/procam/Algo1.kt <<'KT_ALGO1'
+          package com.rupom.procam
+
+          class EnhParams(
+            val level: Int,
+            val lite: Boolean,
+            val sharp: Int,
+            val beauty: Int,
+            val colBoost: Boolean,
+            val zoomBoost: Boolean,
+            val gain: Float,
+            val clarity: Float
+          )
+
+          class GScratch(n: Int) {
+            val t = FloatArray(n)
+            val x1 = FloatArray(n)
+            val mI = FloatArray(n)
+            val mII = FloatArray(n)
+            val a = FloatArray(n)
+            val b = FloatArray(n)
+            val mA = FloatArray(n)
+            val mB = FloatArray(n)
+          }
+
+          class NoiseMap(val bs: Int, val gw: Int, val gh: Int, val g: FloatArray) {
+            // fills dst[0 until w] with the interpolated noise level for image row y
+            fun fillRow(y: Int, w: Int, dst: FloatArray, off: Int) {
+              val fy = (y + 0.5f) / bs - 0.5f
+              var y0 = fy.toInt()
+              if (fy < 0f) y0 = 0
+              if (y0 > gh - 1) y0 = gh - 1
+              val y1 = Math.min(gh - 1, y0 + 1)
+              var ty = fy - y0
+              if (ty < 0f) ty = 0f else if (ty > 1f) ty = 1f
+              for (x in 0 until w) {
+                val fx = (x + 0.5f) / bs - 0.5f
+                var x0 = fx.toInt()
+                if (fx < 0f) x0 = 0
+                if (x0 > gw - 1) x0 = gw - 1
+                val x1 = Math.min(gw - 1, x0 + 1)
+                var tx = fx - x0
+                if (tx < 0f) tx = 0f else if (tx > 1f) tx = 1f
+                dst[off + x] = (g[y0 * gw + x0] * (1f - tx) + g[y0 * gw + x1] * tx) * (1f - ty) +
+                  (g[y1 * gw + x0] * (1f - tx) + g[y1 * gw + x1] * tx) * ty
+              }
+            }
+          }
+
+          object Algo {
+            var forceSigma = 0f
+            fun c8(v: Float): Int = if (v < 0f) 0 else if (v > 254.5f) 255 else (v + 0.5f).toInt()
+            fun c8i(v: Int): Int = if (v < 0) 0 else if (v > 255) 255 else v
+
+            fun ss(a: Float, b: Float, x: Float): Float {
+              var t = (x - a) / (b - a)
+              if (t < 0f) t = 0f else if (t > 1f) t = 1f
+              return t * t * (3f - 2f * t)
+            }
+
+            fun lum(p: Int): Int = (((p shr 16) and 255) * 77 + ((p shr 8) and 255) * 151 + (p and 255) * 28) shr 8
+
+            // robust noise level (std-dev in 0..255 luma units) from the 35th percentile of |laplacian|
+            fun noiseSigma(px: IntArray, w: Int, h: Int): Float {
+              val hist = IntArray(256)
+              var n = 0
+              var y = 2
+              while (y < h - 2) {
+                var x = 2
+                while (x < w - 2) {
+                  val i = y * w + x
+                  var d = 4 * lum(px[i]) - lum(px[i - 1]) - lum(px[i + 1]) - lum(px[i - w]) - lum(px[i + w])
+                  if (d < 0) d = -d
+                  hist[if (d > 255) 255 else d]++
+                  n++
+                  x += 5
+                }
+                y += 5
+              }
+              if (n == 0) return 2f
+              val target = (n * 0.35f).toInt()
+              var acc = 0
+              var q = 0
+              while (q < 255) {
+                acc += hist[q]
+                if (acc >= target) break
+                q++
+              }
+              val s = q / 2.0f
+              return Math.max(0.8f, Math.min(9f, s))
+            }
+
+
+            // local noise level (std-dev, 0..255 luma units) on a coarse grid, from the 25th percentile of 3x3 variances
+            fun noiseMap(px: IntArray, w: Int, h: Int): NoiseMap {
+              val bs = 48
+              val gw = (w + bs - 1) / bs
+              val gh = (h + bs - 1) / bs
+              val raw = FloatArray(gw * gh)
+              val vals = FloatArray(bs * bs / 4 + 16)
+              for (by in 0 until gh) {
+                for (bx in 0 until gw) {
+                  var cnt = 0
+                  val ya = Math.max(1, by * bs)
+                  val yb = Math.min(h - 1, (by + 1) * bs)
+                  val xa = Math.max(1, bx * bs)
+                  val xb = Math.min(w - 1, (bx + 1) * bs)
+                  var y = ya
+                  while (y < yb) {
+                    var x = xa
+                    while (x < xb) {
+                      var s1 = 0
+                      var s2 = 0
+                      for (dy in -1..1) {
+                        val rb = (y + dy) * w + x
+                        for (dx in -1..1) {
+                          val l = lum(px[rb + dx])
+                          s1 += l
+                          s2 += l * l
+                        }
+                      }
+                      vals[cnt++] = (s2 - s1 * s1 / 9f) / 9f
+                      x += 2
+                    }
+                    y += 2
+                  }
+                  var v = -1f
+                  if (cnt >= 30) {
+                    java.util.Arrays.sort(vals, 0, cnt)
+                    v = Math.sqrt((vals[(cnt * 0.25f).toInt()] / 0.57f).toDouble()).toFloat()
+                  }
+                  raw[by * gw + bx] = v
+                }
+              }
+              // reference = 25th percentile of valid blocks; cap textured blocks to a multiple of it
+              val valid = ArrayList<Float>()
+              for (v in raw) if (v >= 0f) valid.add(v)
+              valid.sort()
+              val ref = if (valid.isEmpty()) 1.5f else valid[(valid.size * 0.25f).toInt()]
+              val cap = Math.max(1.8f, 2.6f * Math.max(ref, 0.8f))
+              for (i in raw.indices) raw[i] = if (raw[i] < 0f) ref else Math.min(Math.max(raw[i], 0.8f), cap)
+              // min over 3x3 blocks, then smooth
+              val mn = FloatArray(raw.size)
+              for (by in 0 until gh) for (bx in 0 until gw) {
+                var m = 1000f
+                for (dy in -1..1) for (dx in -1..1) {
+                  val yy = by + dy
+                  val xx = bx + dx
+                  if (yy >= 0 && yy < gh && xx >= 0 && xx < gw) m = Math.min(m, raw[yy * gw + xx])
+                }
+                mn[by * gw + bx] = m
+              }
+              val sm = FloatArray(raw.size)
+              for (by in 0 until gh) for (bx in 0 until gw) {
+                var sum = 0f
+                var c = 0
+                for (dy in -1..1) for (dx in -1..1) {
+                  val yy = by + dy
+                  val xx = bx + dx
+                  if (yy >= 0 && yy < gh && xx >= 0 && xx < gw) { sum += mn[yy * gw + xx]; c++ }
+                }
+                sm[by * gw + bx] = sum / c
+              }
+              return NoiseMap(bs, gw, gh, sm)
+            }
+
+            // running-sum box mean with edge clamp. src/dst/tmp are at least w*h long.
+            fun box(src: FloatArray, dst: FloatArray, tmp: FloatArray, w: Int, h: Int, r: Int) {
+              val div = 1f / (2 * r + 1)
+              for (y in 0 until h) {
+                val b = y * w
+                var s = 0f
+                for (i in -r..r) {
+                  val xi = if (i < 0) 0 else if (i > w - 1) w - 1 else i
+                  s += src[b + xi]
+                }
+                for (x in 0 until w) {
+                  tmp[b + x] = s * div
+                  val xa = if (x + r + 1 > w - 1) w - 1 else x + r + 1
+                  val xb = if (x - r < 0) 0 else x - r
+                  s += src[b + xa] - src[b + xb]
+                }
+              }
+              val cs = FloatArray(w)
+              for (i in -r..r) {
+                val yi = if (i < 0) 0 else if (i > h - 1) h - 1 else i
+                val rb = yi * w
+                for (x in 0 until w) cs[x] += tmp[rb + x]
+              }
+              for (y in 0 until h) {
+                val ob = y * w
+                for (x in 0 until w) dst[ob + x] = cs[x] * div
+                val ya = (if (y + r + 1 > h - 1) h - 1 else y + r + 1) * w
+                val yb = (if (y - r < 0) 0 else y - r) * w
+                for (x in 0 until w) cs[x] += tmp[ya + x] - tmp[yb + x]
+              }
+            }
+
+            // self-guided filter (edge preserving smoothing). eps[i] = k2 * sig[i]^2. s.a keeps the per-pixel edge coefficient.
+            fun guidedSelf(gi: FloatArray, out: FloatArray, w: Int, h: Int, r: Int, sig: FloatArray, k2: Float, s: GScratch) {
+              val n = w * h
+              box(gi, s.mI, s.t, w, h, r)
+              for (i in 0 until n) s.x1[i] = gi[i] * gi[i]
+              box(s.x1, s.mII, s.t, w, h, r)
+              for (i in 0 until n) {
+                var v = s.mII[i] - s.mI[i] * s.mI[i]
+                if (v < 0f) v = 0f
+                val k = v / (v + k2 * sig[i] * sig[i] + 0.05f)
+                s.a[i] = k
+                s.b[i] = (1f - k) * s.mI[i]
+              }
+              box(s.a, s.mA, s.t, w, h, r)
+              box(s.b, s.mB, s.t, w, h, r)
+              for (i in 0 until n) out[i] = s.mA[i] * gi[i] + s.mB[i]
+            }
+          }
+          KT_ALGO1
+          cat > app/src/main/java/com/rupom/procam/Algo2.kt <<'KT_ALGO2'
+          package com.rupom.procam
+
+          // photo enhancement: edge-preserving denoise, hue-preserving colour, natural tone, noise-aware sharpening
+          // Works on horizontal strips (64 rows + 10 row margins); strips are handed out to worker threads.
+          class EnhJob(
+            val px: IntArray,
+            val w: Int,
+            val h: Int,
+            val p: EnhParams,
+            val faces: IntArray,
+            val out: IntArray,
+            val nmap: NoiseMap,
+            val lg: FloatArray,
+            val gw: Int,
+            val gh: Int
+          ) {
+            val gs = 16
+            val SH = 64
+            val M = 10
+            val nStrips = (h + SH - 1) / SH
+            val lite = p.lite
+            val lv = p.level
+            val kY = (if (lite) 1.1f else floatArrayOf(1.4f, 1.9f, 2.5f)[lv]) + (if (p.zoomBoost) 0.4f else 0f)
+            val sharpAmt = (if (lite) 0.45f else floatArrayOf(0f, 0.55f, 0.9f, 1.4f)[p.sharp]) +
+              (if (!lite && p.sharp > 0 && p.zoomBoost) 0.15f else 0f)
+            val tone = if (lite) 0f else floatArrayOf(0.8f, 1f, 1.25f)[lv]
+            val sCurve = if (lite) 0f else floatArrayOf(0.12f, 0.18f, 0.26f)[lv]
+            val clar = if (lite) 0f else floatArrayOf(0.10f, 0.14f, 0.20f)[lv] * p.clarity
+            val vib = if (lite) 0f else floatArrayOf(0.10f, 0.16f, 0.24f)[lv]
+            val boostC = p.colBoost && !lite
+            val bLv = if (lite) 0 else p.beauty
+            val bBr = floatArrayOf(0f, 0.05f, 0.09f, 0.14f)[bLv]
+            val bSm = floatArrayOf(0f, 0.25f, 0.45f, 0.65f)[bLv]
+            val gainG = p.gain
+            val lut = FloatArray(1026)
+            val lutK = 1024f / 255f
+
+            init {
+              for (i in 0..1025) {
+                val x = Math.min(1f, i / 1024f)
+                val s = x * x * (3f - 2f * x)
+                lut[i] = 255f * (x + sCurve * (s - x))
+              }
+            }
+
+            fun run(next: java.util.concurrent.atomic.AtomicInteger) {
+              val maxN = w * (SH + 2 * M)
+              val Y = FloatArray(maxN)
+              val CB = FloatArray(maxN)
+              val CR = FloatArray(maxN)
+              val YD = FloatArray(maxN)
+              val CBD = FloatArray(maxN)
+              val CRD = FloatArray(maxN)
+              val SIG = FloatArray(maxN)
+              val M3 = FloatArray(maxN)
+              val FW = ByteArray(maxN)
+              val S = GScratch(maxN)
+              val AY = S.a
+              val k2 = kY * kY
+              val faceCount = faces.size / 4
+              val fSig = Algo.forceSigma
+              // local copies for the hot loop
+              val sharpAmt = this.sharpAmt
+              val sharpAmt2 = sharpAmt * 0.35f
+              val tone = this.tone
+              val clar = this.clar
+              val vib = this.vib
+              val boostC = this.boostC
+              val bLv = this.bLv
+              val bBr = this.bBr
+              val bSm = this.bSm
+              val gainG = this.gainG
+              val lut = this.lut
+              val lutK = this.lutK
+              val lg = this.lg
+              val gs = this.gs
+              val gw = this.gw
+              val gh = this.gh
+              val w = this.w
+              val h = this.h
+              val px = this.px
+              val out = this.out
+              while (true) {
+                val si = next.getAndIncrement()
+                if (si >= nStrips) break
+                val y0 = si * SH
+                val y1 = Math.min(h, y0 + SH)
+                val a = Math.max(0, y0 - M)
+                val b = Math.min(h, y1 + M)
+                val sh = b - a
+                val n = w * sh
+                for (r in 0 until sh) {
+                  val pb = (a + r) * w
+                  val sb = r * w
+                  for (x in 0 until w) {
+                    val p0 = px[pb + x]
+                    val rr = ((p0 shr 16) and 255).toFloat()
+                    val gg = ((p0 shr 8) and 255).toFloat()
+                    val bb = (p0 and 255).toFloat()
+                    val yv = 0.299f * rr + 0.587f * gg + 0.114f * bb
+                    Y[sb + x] = yv
+                    CB[sb + x] = (bb - yv) * 0.564f
+                    CR[sb + x] = (rr - yv) * 0.713f
+                  }
+                  nmap.fillRow(a + r, w, SIG, sb)
+                }
+                if (fSig > 0f) for (i in 0 until n) SIG[i] = fSig
+                Algo.guidedSelf(Y, YD, w, sh, 2, SIG, k2, S)
+                Algo.box(CB, CBD, S.t, w, sh, 5)
+                Algo.box(CR, CRD, S.t, w, sh, 5)
+                Algo.box(YD, M3, S.t, w, sh, 3)
+                java.util.Arrays.fill(FW, 0, n, 0.toByte())
+                if (bLv > 0) {
+                  for (f in 0 until faceCount) {
+                    val fl = faces[4 * f]
+                    val ft = faces[4 * f + 1]
+                    val fr = faces[4 * f + 2]
+                    val fb = faces[4 * f + 3]
+                    val cx = (fl + fr) / 2f
+                    val cy = (ft + fb) / 2f - (fb - ft) * 0.04f
+                    val rx = (fr - fl) * 0.62f
+                    val ry = (fb - ft) * 0.72f
+                    if (rx < 4f || ry < 4f) continue
+                    val ya = Math.max(a, (cy - ry).toInt())
+                    val yb = Math.min(b - 1, (cy + ry).toInt())
+                    val xa = Math.max(0, (cx - rx).toInt())
+                    val xb = Math.min(w - 1, (cx + rx).toInt())
+                    for (yy in ya..yb) {
+                      val dy = (yy - cy) / ry
+                      for (xx in xa..xb) {
+                        val dx = (xx - cx) / rx
+                        val d = dx * dx + dy * dy
+                        if (d < 1f) {
+                          var v = (1f - d) * 2f
+                          if (v > 1f) v = 1f
+                          val iv = (v * 255f).toInt()
+                          val k = (yy - a) * w + xx
+                          if (iv > (FW[k].toInt() and 255)) FW[k] = iv.toByte()
+                        }
+                      }
+                    }
+                  }
+                }
+                for (yy in y0 until y1) {
+                  val r = yy - a
+                  val rowS = r * w
+                  val rU = if (r > 0) rowS - w else rowS
+                  val rD = if (r < sh - 1) rowS + w else rowS
+                  val gyf = (yy + 0.5f) / gs - 0.5f
+                  var gy0 = gyf.toInt()
+                  if (gy0 < 0) gy0 = 0
+                  if (gy0 > gh - 1) gy0 = gh - 1
+                  val gy1 = Math.min(gh - 1, gy0 + 1)
+                  var fy = gyf - gy0
+                  if (fy < 0f) fy = 0f else if (fy > 1f) fy = 1f
+                  for (x in 0 until w) {
+                    val i = rowS + x
+                    val xl = if (x > 0) x - 1 else x
+                    val xr = if (x < w - 1) x + 1 else x
+                    val c = YD[i]
+                    val fwv = (FW[i].toInt() and 255) * (1f / 255f)
+                    val ac = AY[i]
+                    val flat = 1f - Math.max(0f, Math.min(1f, ac))
+                    var base = c
+                    if (fwv > 0f) base = c + (M3[i] - c) * bSm * fwv * flat
+                    var ys = base
+                    if (sharpAmt > 0f) {
+                      val l = YD[rowS + xl]
+                      val rg = YD[rowS + xr]
+                      val u = YD[rU + x]
+                      val d = YD[rD + x]
+                      val ul = YD[rU + xl]
+                      val ur = YD[rU + xr]
+                      val dl = YD[rD + xl]
+                      val dr = YD[rD + xr]
+                      val bl = (4f * c + 2f * (l + rg + u + d) + ul + ur + dl + dr) * (1f / 16f)
+                      var mn = c
+                      var mx = c
+                      if (l < mn) mn = l else if (l > mx) mx = l
+                      if (rg < mn) mn = rg else if (rg > mx) mx = rg
+                      if (u < mn) mn = u else if (u > mx) mx = u
+                      if (d < mn) mn = d else if (d > mx) mx = d
+                      if (ul < mn) mn = ul else if (ul > mx) mx = ul
+                      if (ur < mn) mn = ur else if (ur > mx) mx = ur
+                      if (dl < mn) mn = dl else if (dl > mx) mx = dl
+                      if (dr < mn) mn = dr else if (dr > mx) mx = dr
+                      val sres = 0.35f * SIG[i]
+                      val th1 = 0.6f * sres + 0.3f
+                      val th2 = 0.9f * sres + 0.4f
+                      val det = c - bl
+                      val ad = if (det < 0f) -det else det
+                      val d1 = if (ad <= th1) 0f else det * (ad - th1) / ad
+                      val det2 = c - M3[i]
+                      val ad2 = if (det2 < 0f) -det2 else det2
+                      val d2 = if (ad2 <= th2) 0f else det2 * (ad2 - th2) / ad2
+                      val sa = 1f - 0.7f * fwv
+                      ys = base + sa * (sharpAmt * d1 + sharpAmt2 * d2)
+                      if (ys > mx + 3f) ys = mx + 3f
+                      if (ys < mn - 3f) ys = mn - 3f
+                    }
+                    if (ys < 0f) ys = 0f else if (ys > 255f) ys = 255f
+                    val y01 = ys * (1f / 255f)
+                    var loc = 0.5f
+                    var g = 1f
+                    if (tone > 0f || clar > 0f) {
+                      val gxf = (x + 0.5f) / gs - 0.5f
+                      var gx0 = gxf.toInt()
+                      if (gx0 < 0) gx0 = 0
+                      if (gx0 > gw - 1) gx0 = gw - 1
+                      val gx1 = Math.min(gw - 1, gx0 + 1)
+                      var fx = gxf - gx0
+                      if (fx < 0f) fx = 0f else if (fx > 1f) fx = 1f
+                      loc = (lg[gy0 * gw + gx0] * (1f - fx) + lg[gy0 * gw + gx1] * fx) * (1f - fy) +
+                        (lg[gy1 * gw + gx0] * (1f - fx) + lg[gy1 * gw + gx1] * fx) * fy
+                      val dk = 1f - loc
+                      g = 1f + 0.28f * tone * dk * dk * dk
+                      g *= 1f - 0.11f * tone * Algo.ss(0.6f, 0.92f, loc) * (1f - Algo.ss(0.90f, 0.99f, y01))
+                    }
+                    if (gainG < 1f) g *= gainG + (1f - gainG) * Algo.ss(0.7f, 1f, y01)
+                    var y2 = ys * g
+                    if (clar > 0f) {
+                      var cd = clar * (y2 - loc * 255f * g) * (4f * y01 * (1f - y01))
+                      if (cd > 18f) cd = 18f else if (cd < -18f) cd = -18f
+                      y2 += cd
+                    }
+                    if (y2 < 0f) y2 = 0f else if (y2 > 255f) y2 = 255f
+                    val lf = y2 * lutK
+                    val li = lf.toInt()
+                    val lr = lf - li
+                    var yL = lut[li] * (1f - lr) + lut[li + 1] * lr
+                    // chroma: smoothed where the luma is flat (noise), untouched where there is an edge
+                    val wC = 1f - Algo.ss(0.30f, 0.75f, ac)
+                    val cbv = CB[i] + (CBD[i] - CB[i]) * wC
+                    val crv = CR[i] + (CRD[i] - CR[i]) * wC
+                    val skin = cbv >= -51f && cbv <= -1f && crv >= 5f && crv <= 45f
+                    if (fwv > 0f) yL *= 1f + bBr * fwv * (if (skin) 1f else 0.35f) * (1.15f - yL * (1f / 255f))
+                    if (yL > 255f) yL = 255f
+                    // saturation of the pixel before tone mapping (for vibrance)
+                    val r0 = ys + 1.4025f * crv
+                    val b0 = ys + 1.7730f * cbv
+                    val g0 = ys - 0.5094f * (r0 - ys) - 0.1942f * (b0 - ys)
+                    var mx0 = r0
+                    if (g0 > mx0) mx0 = g0
+                    if (b0 > mx0) mx0 = b0
+                    var mn0 = r0
+                    if (g0 < mn0) mn0 = g0
+                    if (b0 < mn0) mn0 = b0
+                    val sIn = if (mx0 > 8f) (mx0 - mn0) / mx0 else 0f
+                    val e = (yL + 1f) / (ys + 1f) - 1f
+                    var f = 1f + 0.8f * e - 0.08f * e * e
+                    if (vib > 0f) f *= 1f + vib * (1f - sIn) * (if (skin) 0.3f else 1f)
+                    if (boostC && !skin && sIn > 0.40f) f *= 1f + 0.05f * Math.min(1f, (sIn - 0.40f) / 0.3f)
+                    if (f < 0.6f) f = 0.6f else if (f > 1.6f) f = 1.6f
+                    f *= 1f - 0.5f * Algo.ss(0.88f, 1f, yL * (1f / 255f))
+                    var dR = 1.4025f * crv * f
+                    var dB = 1.7730f * cbv * f
+                    var dG = -0.5094f * dR - 0.1942f * dB
+                    var lim = 1f
+                    if (dR > 0.01f) lim = Math.min(lim, (255f - yL) / dR) else if (dR < -0.01f) lim = Math.min(lim, yL / -dR)
+                    if (dG > 0.01f) lim = Math.min(lim, (255f - yL) / dG) else if (dG < -0.01f) lim = Math.min(lim, yL / -dG)
+                    if (dB > 0.01f) lim = Math.min(lim, (255f - yL) / dB) else if (dB < -0.01f) lim = Math.min(lim, yL / -dB)
+                    if (lim < 1f) {
+                      dR *= lim
+                      dG *= lim
+                      dB *= lim
+                    }
+                    var hh = x * 374761393 + yy * 668265263
+                    hh = (hh xor (hh ushr 13)) * 1274126177
+                    hh = hh xor (hh ushr 16)
+                    val dn = (hh and 255) * (1f / 255f) - 0.5f
+                    out[yy * w + x] = (255 shl 24) or (Algo.c8(yL + dR + dn) shl 16) or (Algo.c8(yL + dG + dn) shl 8) or Algo.c8(yL + dB + dn)
+                  }
+                }
+              }
+            }
+          }
+
+          fun Algo.enhance(px: IntArray, w: Int, h: Int, p: EnhParams, faces: IntArray): IntArray {
+            val out = IntArray(w * h)
+            val nmap = noiseMap(px, w, h)
+            // coarse local-brightness grid (about 16 px cells, smoothed) for shadow/highlight balance and clarity
+            val gs = 16
+            val gw = (w + gs - 1) / gs
+            val gh = (h + gs - 1) / gs
+            val lg = FloatArray(gw * gh)
+            val gc = IntArray(gw * gh)
+            var yy0 = 0
+            while (yy0 < h) {
+              var xx0 = 0
+              val rb = yy0 * w
+              val gb = (yy0 / gs) * gw
+              while (xx0 < w) {
+                lg[gb + xx0 / gs] += lum(px[rb + xx0]).toFloat()
+                gc[gb + xx0 / gs]++
+                xx0 += 3
+              }
+              yy0 += 3
+            }
+            for (i in lg.indices) lg[i] = if (gc[i] > 0) lg[i] / gc[i] / 255f else 0.5f
+            val gt = FloatArray(lg.size)
+            val go = FloatArray(lg.size)
+            box(lg, go, gt, gw, gh, 2)
+            box(go, lg, gt, gw, gh, 2)
+
+            val job = EnhJob(px, w, h, p, faces, out, nmap, lg, gw, gh)
+            val next = java.util.concurrent.atomic.AtomicInteger(0)
+            val nT = Math.max(1, Math.min(3, Runtime.getRuntime().availableProcessors()))
+            if (nT == 1) {
+              job.run(next)
+            } else {
+              val errs = arrayOfNulls<Throwable>(nT)
+              val ths = ArrayList<Thread>()
+              for (t in 0 until nT) {
+                val th = Thread {
+                  try {
+                    job.run(next)
+                  } catch (e: Throwable) {
+                    errs[t] = e
+                  }
+                }
+                ths.add(th)
+                th.start()
+              }
+              for (th in ths) th.join()
+              for (e in errs) if (e != null) throw e
+            }
+            return out
+          }
+          KT_ALGO2
+          cat > app/src/main/java/com/rupom/procam/Merge.kt <<'KT_MERGE'
+          package com.rupom.procam
+
+          // ===== multi-frame alignment and robust merging (pure Kotlin, no Android APIs) =====
+
+          object Par {
+            fun threads(): Int = Math.max(1, Math.min(3, Runtime.getRuntime().availableProcessors()))
+
+            // runs body on nT threads (body pulls its own work from a shared counter); rethrows the first failure
+            fun run(nT: Int, body: () -> Unit) {
+              if (nT <= 1) {
+                body()
+                return
+              }
+              val errs = arrayOfNulls<Throwable>(nT)
+              val ths = ArrayList<Thread>()
+              for (t in 0 until nT) {
+                val th = Thread {
+                  try {
+                    body()
+                  } catch (e: Throwable) {
+                    errs[t] = e
+                  }
+                }
+                ths.add(th)
+                th.start()
+              }
+              for (th in ths) th.join()
+              for (e in errs) if (e != null) throw e
+            }
+          }
+
+          class Pyr(val w: IntArray, val h: IntArray, val l: Array<ByteArray>)
+
+          // per-tile integer shifts: frame pixel (x + sx, y + sy) corresponds to reference pixel (x, y); units = full-resolution pixels
+          class Aligned(val tile: Int, val gw: Int, val gh: Int, val sx: IntArray, val sy: IntArray)
+
+          // global motion model: shift = a0 + a1*X + a2*Y (X,Y = pixel offset from the image centre / 1000), same for y with b*
+          class Affine(val a0: Double, val a1: Double, val a2: Double, val b0: Double, val b1: Double, val b2: Double, val cx: Double, val cy: Double) {
+            fun dx(x: Double, y: Double): Double = a0 + a1 * (x - cx) * 0.001 + a2 * (y - cy) * 0.001
+            fun dy(x: Double, y: Double): Double = b0 + b1 * (x - cx) * 0.001 + b2 * (y - cy) * 0.001
+          }
+
+          object AffineFit {
+            private fun solve3(m: DoubleArray, r: DoubleArray): DoubleArray? {
+              val a = m[0]; val b = m[1]; val c = m[2]; val d = m[3]; val e = m[4]; val f = m[5]; val g = m[6]; val h = m[7]; val i = m[8]
+              val det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+              if (Math.abs(det) < 1e-9) return null
+              val x = (r[0] * (e * i - f * h) - b * (r[1] * i - f * r[2]) + c * (r[1] * h - e * r[2])) / det
+              val y = (a * (r[1] * i - f * r[2]) - r[0] * (d * i - f * g) + c * (d * r[2] - r[1] * g)) / det
+              val z = (a * (e * r[2] - r[1] * h) - b * (d * r[2] - r[1] * g) + r[0] * (d * h - e * g)) / det
+              return doubleArrayOf(x, y, z)
+            }
+
+            // least squares fit over the tiles flagged in 'use'; px,py = tile centres (full-res px), vx,vy = measured shifts (full-res px)
+            private fun fitOnce(px: DoubleArray, py: DoubleArray, vx: DoubleArray, vy: DoubleArray, use: BooleanArray, cx: Double, cy: Double): Affine? {
+              var n = 0.0; var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0; var syy = 0.0
+              var v0 = 0.0; var v1 = 0.0; var v2 = 0.0; var u0 = 0.0; var u1 = 0.0; var u2 = 0.0
+              for (i in px.indices) {
+                if (!use[i]) continue
+                val x = (px[i] - cx) * 0.001
+                val y = (py[i] - cy) * 0.001
+                n += 1.0; sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y
+                v0 += vx[i]; v1 += vx[i] * x; v2 += vx[i] * y
+                u0 += vy[i]; u1 += vy[i] * x; u2 += vy[i] * y
+              }
+              if (n < 6.0) return null
+              val m = doubleArrayOf(n, sx, sy, sx, sxx, sxy, sy, sxy, syy)
+              val ax = solve3(m, doubleArrayOf(v0, v1, v2)) ?: return null
+              val ay = solve3(m, doubleArrayOf(u0, u1, u2)) ?: return null
+              return Affine(ax[0], ax[1], ax[2], ay[0], ay[1], ay[2], cx, cy)
+            }
+
+            // robust fit: repeat, dropping tiles whose residual is large (moving objects, wrong matches on repetitive texture)
+            fun fit(px: DoubleArray, py: DoubleArray, vx: DoubleArray, vy: DoubleArray, start: BooleanArray, cx: Double, cy: Double, unit: Double): Affine? {
+              val n = px.size
+              val use = start.copyOf()
+              var model: Affine? = null
+              val res = DoubleArray(n)
+              for (it in 0 until 5) {
+                val m = fitOnce(px, py, vx, vy, use, cx, cy) ?: return model
+                model = m
+                var cnt = 0
+                for (i in 0 until n) {
+                  res[i] = Math.abs(m.dx(px[i], py[i]) - vx[i]) + Math.abs(m.dy(px[i], py[i]) - vy[i])
+                  if (use[i]) cnt++
+                }
+                val rs = DoubleArray(cnt)
+                var c = 0
+                for (i in 0 until n) if (use[i]) rs[c++] = res[i]
+                java.util.Arrays.sort(rs)
+                val med = rs[cnt / 2]
+                val thr = Math.max(1.5 * unit, 3.0 * med)
+                var kept = 0
+                for (i in 0 until n) {
+                  use[i] = start[i] && res[i] <= thr
+                  if (use[i]) kept++
+                }
+                if (kept < Math.max(6, n / 10)) return model
+              }
+              return fitOnce(px, py, vx, vy, use, cx, cy) ?: model
+            }
+          }
+
+          object Merge {
+            fun luma8(px: IntArray, w: Int, h: Int): ByteArray {
+              val o = ByteArray(w * h)
+              for (i in 0 until w * h) {
+                val p = px[i]
+                o[i] = ((((p shr 16) and 255) * 77 + ((p shr 8) and 255) * 151 + (p and 255) * 28) shr 8).toByte()
+              }
+              return o
+            }
+
+            fun down2(src: ByteArray, w: Int, h: Int): ByteArray {
+              val w2 = w / 2
+              val h2 = h / 2
+              val o = ByteArray(w2 * h2)
+              for (y in 0 until h2) {
+                val a = 2 * y * w
+                val b = a + w
+                for (x in 0 until w2) {
+                  val i = 2 * x
+                  o[y * w2 + x] = (((src[a + i].toInt() and 255) + (src[a + i + 1].toInt() and 255) +
+                    (src[b + i].toInt() and 255) + (src[b + i + 1].toInt() and 255) + 2) shr 2).toByte()
+                }
+              }
+              return o
+            }
+
+            fun pyramid(l0: ByteArray, w: Int, h: Int): Pyr {
+              val ws = IntArray(4)
+              val hs = IntArray(4)
+              val ls = Array(4) { ByteArray(0) }
+              ws[0] = w
+              hs[0] = h
+              ls[0] = l0
+              for (k in 1..3) {
+                ws[k] = ws[k - 1] / 2
+                hs[k] = hs[k - 1] / 2
+                ls[k] = down2(ls[k - 1], ws[k - 1], hs[k - 1])
+              }
+              return Pyr(ws, hs, ls)
+            }
+
+            // mean absolute gradient (sampled) - used to rank frames by sharpness
+            fun sharp(l: ByteArray, w: Int, h: Int): Float {
+              var s = 0L
+              var c = 0L
+              var y = 2
+              while (y < h - 2) {
+                var x = 2
+                while (x < w - 2) {
+                  val i = y * w + x
+                  var dx = (l[i + 1].toInt() and 255) - (l[i - 1].toInt() and 255)
+                  var dy = (l[i + w].toInt() and 255) - (l[i - w].toInt() and 255)
+                  if (dx < 0) dx = -dx
+                  if (dy < 0) dy = -dy
+                  s += dx + dy
+                  c++
+                  x += 2
+                }
+                y += 2
+              }
+              return if (c == 0L) 0f else s.toFloat() / c
+            }
+
+            private fun sadBlock(a: ByteArray, b: ByteArray, w: Int, ax: Int, ay: Int, bx: Int, by: Int, bw: Int, bh: Int, st: Int, limit: Int): Int {
+              var s = 0
+              var y = 0
+              while (y < bh) {
+                var ia = (ay + y) * w + ax
+                var ib = (by + y) * w + bx
+                var x = 0
+                while (x < bw) {
+                  val d = (a[ia].toInt() and 255) - (b[ib].toInt() and 255)
+                  s += if (d < 0) -d else d
+                  ia += st
+                  ib += st
+                  x += st
+                }
+                if (s >= limit) return s
+                y += st
+              }
+              return s
+            }
+
+            // coarsest level: full search around 0, with a distinctness test so flat / ambiguous tiles can be filled from neighbours
+            private fun searchCoarse(a: ByteArray, b: ByteArray, w: Int, h: Int, tile: Int, gw: Int, gh: Int, rad: Int, st: Int, ox: IntArray, oy: IntArray, valid: BooleanArray): Int {
+              val nc = 2 * rad + 1
+              val costs = IntArray(nc * nc)
+              var nValid = 0
+              for (ty in 0 until gh) {
+                for (tx in 0 until gw) {
+                  val ti = ty * gw + tx
+                  val rx = tx * tile
+                  val ry = ty * tile
+                  val bw = Math.min(tile, w - rx)
+                  val bh = Math.min(tile, h - ry)
+                  if (bw < 8 || bh < 8) continue
+                  var best = Int.MAX_VALUE
+                  var bdx = 0
+                  var bdy = 0
+                  var sum = 0L
+                  var cnt = 0
+                  for (dy in -rad..rad) {
+                    for (dx in -rad..rad) {
+                      val cx = rx + dx
+                      val cy = ry + dy
+                      val k = (dy + rad) * nc + (dx + rad)
+                      if (cx < 0 || cy < 0 || cx + bw > w || cy + bh > h) {
+                        costs[k] = Int.MAX_VALUE
+                        continue
+                      }
+                      val c = sadBlock(a, b, w, rx, ry, cx, cy, bw, bh, st, Int.MAX_VALUE)
+                      costs[k] = c
+                      sum += c
+                      cnt++
+                      if (c < best) {
+                        best = c
+                        bdx = dx
+                        bdy = dy
+                      }
+                    }
+                  }
+                  if (cnt < 9 || best == Int.MAX_VALUE) continue
+                  var far = Int.MAX_VALUE
+                  for (dy in -rad..rad) {
+                    for (dx in -rad..rad) {
+                      val c = costs[(dy + rad) * nc + (dx + rad)]
+                      if (c == Int.MAX_VALUE) continue
+                      val ddx = dx - bdx
+                      val ddy = dy - bdy
+                      if ((ddx < -1 || ddx > 1 || ddy < -1 || ddy > 1) && c < far) far = c
+                    }
+                  }
+                  val avg = sum.toFloat() / cnt
+                  val onEdge = bdx == -rad || bdx == rad || bdy == -rad || bdy == rad
+                  val distinct = far != Int.MAX_VALUE && (far - best) >= 0.05f * far && (avg - best) >= 0.10f * avg
+                  ox[ti] = bdx
+                  oy[ti] = bdy
+                  if (distinct && !onEdge) {
+                    valid[ti] = true
+                    nValid++
+                  }
+                }
+              }
+              if (nValid < 3) {
+                java.util.Arrays.fill(ox, 0)
+                java.util.Arrays.fill(oy, 0)
+                return nValid
+              }
+              // fill invalid tiles with the median of valid tiles nearby (growing window), then a 3x3 median to drop outliers
+              val gx = ox.copyOf()
+              val gy = oy.copyOf()
+              val vx = IntArray(121)
+              val vy = IntArray(121)
+              for (ty in 0 until gh) {
+                for (tx in 0 until gw) {
+                  val ti = ty * gw + tx
+                  if (valid[ti]) continue
+                  var r = 2
+                  var found = false
+                  while (r <= 8 && !found) {
+                    var c = 0
+                    for (yy in Math.max(0, ty - r)..Math.min(gh - 1, ty + r)) {
+                      for (xx in Math.max(0, tx - r)..Math.min(gw - 1, tx + r)) {
+                        if (valid[yy * gw + xx] && c < 121) {
+                          vx[c] = ox[yy * gw + xx]
+                          vy[c] = oy[yy * gw + xx]
+                          c++
+                        }
+                      }
+                    }
+                    if (c >= 3) {
+                      java.util.Arrays.sort(vx, 0, c)
+                      java.util.Arrays.sort(vy, 0, c)
+                      gx[ti] = vx[c / 2]
+                      gy[ti] = vy[c / 2]
+                      found = true
+                    }
+                    r += 2
+                  }
+                  if (!found) {
+                    // global median of valid tiles
+                    var c = 0
+                    val ax = IntArray(nValid)
+                    val ay = IntArray(nValid)
+                    for (i in valid.indices) if (valid[i]) {
+                      ax[c] = ox[i]
+                      ay[c] = oy[i]
+                      c++
+                    }
+                    java.util.Arrays.sort(ax)
+                    java.util.Arrays.sort(ay)
+                    gx[ti] = ax[c / 2]
+                    gy[ti] = ay[c / 2]
+                  }
+                }
+              }
+              val t9 = IntArray(9)
+              for (ty in 0 until gh) {
+                for (tx in 0 until gw) {
+                  var c = 0
+                  for (yy in Math.max(0, ty - 1)..Math.min(gh - 1, ty + 1)) {
+                    for (xx in Math.max(0, tx - 1)..Math.min(gw - 1, tx + 1)) {
+                      t9[c++] = gx[yy * gw + xx]
+                    }
+                  }
+                  java.util.Arrays.sort(t9, 0, c)
+                  ox[ty * gw + tx] = t9[c / 2]
+                  c = 0
+                  for (yy in Math.max(0, ty - 1)..Math.min(gh - 1, ty + 1)) {
+                    for (xx in Math.max(0, tx - 1)..Math.min(gw - 1, tx + 1)) {
+                      t9[c++] = gy[yy * gw + xx]
+                    }
+                  }
+                  java.util.Arrays.sort(t9, 0, c)
+                  oy[ty * gw + tx] = t9[c / 2]
+                }
+              }
+              return nValid
+            }
+
+            // initial shifts for a finer level: bilinear sample of the parent field, doubled
+            private fun upInit(px: IntArray, py: IntArray, pgw: Int, pgh: Int, ptile: Int, ctile: Int, cgw: Int, cgh: Int, cw: Int, ch: Int, ix: IntArray, iy: IntArray) {
+              for (ty in 0 until cgh) {
+                for (tx in 0 until cgw) {
+                  val cx = Math.min(cw - 1f, (tx + 0.5f) * ctile)
+                  val cy = Math.min(ch - 1f, (ty + 0.5f) * ctile)
+                  var u = cx * 0.5f / ptile - 0.5f
+                  var v = cy * 0.5f / ptile - 0.5f
+                  if (u < 0f) u = 0f
+                  if (v < 0f) v = 0f
+                  if (u > pgw - 1f) u = pgw - 1f
+                  if (v > pgh - 1f) v = pgh - 1f
+                  val u0 = u.toInt()
+                  val v0 = v.toInt()
+                  val u1 = Math.min(pgw - 1, u0 + 1)
+                  val v1 = Math.min(pgh - 1, v0 + 1)
+                  val fu = u - u0
+                  val fv = v - v0
+                  val sx = (px[v0 * pgw + u0] * (1f - fu) + px[v0 * pgw + u1] * fu) * (1f - fv) + (px[v1 * pgw + u0] * (1f - fu) + px[v1 * pgw + u1] * fu) * fv
+                  val sy = (py[v0 * pgw + u0] * (1f - fu) + py[v0 * pgw + u1] * fu) * (1f - fv) + (py[v1 * pgw + u0] * (1f - fu) + py[v1 * pgw + u1] * fu) * fv
+                  ix[ty * cgw + tx] = Math.round(2f * sx)
+                  iy[ty * cgw + tx] = Math.round(2f * sy)
+                }
+              }
+            }
+
+            // refine around the initial shift with a small search; only move away from the initial shift if clearly better.
+            // conf = how much better the best candidate is than the average candidate (0 for flat / ambiguous tiles)
+            private fun refine(a: ByteArray, b: ByteArray, w: Int, h: Int, tile: Int, gw: Int, gh: Int, rad: Int, st: Int, ix: IntArray, iy: IntArray, ox: IntArray, oy: IntArray, conf: FloatArray) {
+              for (ty in 0 until gh) {
+                for (tx in 0 until gw) {
+                  val ti = ty * gw + tx
+                  val rx = tx * tile
+                  val ry = ty * tile
+                  val bw = Math.min(tile, w - rx)
+                  val bh = Math.min(tile, h - ry)
+                  var sx = ix[ti]
+                  var sy = iy[ti]
+                  conf[ti] = 0f
+                  if (bw < 8 || bh < 8) {
+                    ox[ti] = sx
+                    oy[ti] = sy
+                    continue
+                  }
+                  // keep the block inside the frame
+                  if (rx + sx < 0) sx = -rx
+                  if (ry + sy < 0) sy = -ry
+                  if (rx + sx + bw > w) sx = w - bw - rx
+                  if (ry + sy + bh > h) sy = h - bh - ry
+                  val c0 = sadBlock(a, b, w, rx, ry, rx + sx, ry + sy, bw, bh, st, Int.MAX_VALUE)
+                  var best = c0
+                  var bx = sx
+                  var by = sy
+                  var sum = c0.toLong()
+                  var cnt = 1
+                  for (dy in -rad..rad) {
+                    for (dx in -rad..rad) {
+                      if (dx == 0 && dy == 0) continue
+                      val cx = rx + sx + dx
+                      val cy = ry + sy + dy
+                      if (cx < 0 || cy < 0 || cx + bw > w || cy + bh > h) continue
+                      val c = sadBlock(a, b, w, rx, ry, cx, cy, bw, bh, st, Int.MAX_VALUE)
+                      sum += c
+                      cnt++
+                      if (c < best) {
+                        best = c
+                        bx = sx + dx
+                        by = sy + dy
+                      }
+                    }
+                  }
+                  if (cnt >= 4 && sum > 0L) {
+                    val avg = sum.toFloat() / cnt
+                    conf[ti] = (avg - best) / avg
+                  }
+                  if (best > 0.97f * c0) {
+                    bx = sx
+                    by = sy
+                  }
+                  ox[ti] = bx
+                  oy[ti] = by
+                }
+              }
+            }
+
+            // model-predicted initial shifts for the tiles of one level (level pixels)
+            private fun modelInit(m: Affine, tile: Int, gw: Int, gh: Int, lv: Int, ix: IntArray, iy: IntArray) {
+              val sc = (1 shl lv).toDouble()
+              for (ty in 0 until gh) {
+                for (tx in 0 until gw) {
+                  val x = (tx + 0.5) * tile * sc
+                  val y = (ty + 0.5) * tile * sc
+                  ix[ty * gw + tx] = Math.round(m.dx(x, y) / sc).toInt()
+                  iy[ty * gw + tx] = Math.round(m.dy(x, y) / sc).toInt()
+                }
+              }
+            }
+
+            // robust global-motion fit from the tile shifts of one level
+            private fun fitLevel(cx: IntArray, cy: IntArray, gw: Int, gh: Int, tile: Int, lv: Int, valid: BooleanArray?, w0: Int, h0: Int): Affine? {
+              val n = gw * gh
+              val sc = (1 shl lv).toDouble()
+              val px = DoubleArray(n)
+              val py = DoubleArray(n)
+              val vx = DoubleArray(n)
+              val vy = DoubleArray(n)
+              val use = BooleanArray(n)
+              for (ty in 0 until gh) {
+                for (tx in 0 until gw) {
+                  val i = ty * gw + tx
+                  px[i] = (tx + 0.5) * tile * sc
+                  py[i] = (ty + 0.5) * tile * sc
+                  vx[i] = cx[i] * sc
+                  vy[i] = cy[i] * sc
+                  use[i] = valid == null || valid[i]
+                }
+              }
+              return AffineFit.fit(px, py, vx, vy, use, w0 / 2.0, h0 / 2.0, sc)
+            }
+
+            // hierarchical tile alignment of a frame against the reference (both as luma pyramids), guided by a robust global motion model.
+            // Result: one shift per 32 px tile at full resolution.
+            fun align(ref: Pyr, cur: Pyr): Aligned {
+              val w0 = ref.w[0]
+              val h0 = ref.h[0]
+              val gw0 = (w0 + 31) / 32
+              val gh0 = (h0 + 31) / 32
+              if (ref.w[3] < 32 || ref.h[3] < 32) {
+                return Aligned(32, gw0, gh0, IntArray(gw0 * gh0), IntArray(gw0 * gh0))
+              }
+              // level 3 (1/8): 16 px tiles, +-6, stride 2
+              val gw3 = (ref.w[3] + 15) / 16
+              val gh3 = (ref.h[3] + 15) / 16
+              var cx = IntArray(gw3 * gh3)
+              var cy = IntArray(gw3 * gh3)
+              val valid3 = BooleanArray(gw3 * gh3)
+              searchCoarse(ref.l[3], cur.l[3], ref.w[3], ref.h[3], 16, gw3, gh3, 6, 2, cx, cy, valid3)
+              var model = fitLevel(cx, cy, gw3, gh3, 16, 3, valid3, w0, h0)
+              var pgw = gw3
+              var pgh = gh3
+              // levels 2 and 1: 16 px tiles
+              for (lv in 2 downTo 1) {
+                val gw = (ref.w[lv] + 15) / 16
+                val gh = (ref.h[lv] + 15) / 16
+                val ix = IntArray(gw * gh)
+                val iy = IntArray(gw * gh)
+                val m = model
+                if (m != null) modelInit(m, 16, gw, gh, lv, ix, iy)
+                else upInit(cx, cy, pgw, pgh, 16, 16, gw, gh, ref.w[lv], ref.h[lv], ix, iy)
+                val ox = IntArray(gw * gh)
+                val oy = IntArray(gw * gh)
+                val conf = FloatArray(gw * gh)
+                refine(ref.l[lv], cur.l[lv], ref.w[lv], ref.h[lv], 16, gw, gh, if (lv == 2) 2 else 1, if (lv == 2) 1 else 2, ix, iy, ox, oy, conf)
+                model = fitLevel(ox, oy, gw, gh, 16, lv, BooleanArray(gw * gh) { conf[it] > 0.14f }, w0, h0) ?: model
+                cx = ox
+                cy = oy
+                pgw = gw
+                pgh = gh
+              }
+              // level 0: 32 px tiles, +-1, stride 2
+              val ix = IntArray(gw0 * gh0)
+              val iy = IntArray(gw0 * gh0)
+              val m = model
+              if (m != null) modelInit(m, 32, gw0, gh0, 0, ix, iy)
+              else upInit(cx, cy, pgw, pgh, 16, 32, gw0, gh0, w0, h0, ix, iy)
+              val ox = IntArray(gw0 * gh0)
+              val oy = IntArray(gw0 * gh0)
+              refine(ref.l[0], cur.l[0], w0, h0, 32, gw0, gh0, 1, 2, ix, iy, ox, oy, FloatArray(gw0 * gh0))
+              return Aligned(32, gw0, gh0, ox, oy)
+            }
+          }
+
+          // Robust average of aligned frames. The reference frame always has weight 8; other frames get a per-pixel weight 0..8 that
+          // drops where they disagree with the reference (moving objects, bad alignment) relative to the local noise level.
+          class Merger(val w: Int, val h: Int, val ref: IntArray) {
+            val n = w * h
+            val sum = ShortArray(3 * n)
+            val ws = ByteArray(n)
+            val refL = Merge.luma8(ref, w, h)
+            val refPyr = Merge.pyramid(refL, w, h)
+            val nmap = Algo.noiseMap(ref, w, h)
+            var count = 1
+            var tolA = 2.0f
+            var tolB = 4.2f
+            var lastAccept = 1f
+
+            init {
+              for (i in 0 until n) {
+                val p = ref[i]
+                sum[3 * i] = (((p shr 16) and 255) * 8).toShort()
+                sum[3 * i + 1] = (((p shr 8) and 255) * 8).toShort()
+                sum[3 * i + 2] = ((p and 255) * 8).toShort()
+                ws[i] = 8
+              }
+            }
+
+            // merges one more frame (same size as the reference). returns the accepted fraction (0..1)
+            fun add(cur: IntArray): Float {
+              if (count >= 15) return 0f
+              val curL = Merge.luma8(cur, w, h)
+              val curPyr = Merge.pyramid(curL, w, h)
+              val al = Merge.align(refPyr, curPyr)
+              val rows = al.gh
+              val next = java.util.concurrent.atomic.AtomicInteger(0)
+              val accSum = java.util.concurrent.atomic.AtomicLong(0L)
+              val tolA = this.tolA
+              val tolB = this.tolB
+              Par.run(Par.threads()) {
+                val bw2 = (w + 1) / 2
+                val adb = FloatArray(bw2 * 20)
+                val tsx = IntArray(w)
+                val tsy = IntArray(w)
+                val sigRow = FloatArray(w)
+                val wq = ByteArray(bw2 * 20)
+                var local = 0L
+                while (true) {
+                  val ty = next.getAndIncrement()
+                  if (ty >= rows) break
+                  val y0 = ty * 32
+                  val y1 = Math.min(h, y0 + 32)
+                  for (x in 0 until w) {
+                    val t = Math.min(al.gw - 1, x / 32)
+                    tsx[x] = al.sx[ty * al.gw + t]
+                    tsy[x] = al.sy[ty * al.gw + t]
+                  }
+                  // block rows: one extra row above and below for the 3x3 smoothing
+                  val br0 = y0 / 2 - 1
+                  val br1 = (y1 + 1) / 2
+                  val nbr = br1 - br0 + 1
+                  for (r in 0 until nbr) {
+                    val by = br0 + r
+                    for (bx in 0 until bw2) {
+                      var s = 0
+                      var chromaAd = 0f
+                      for (dy in 0..1) {
+                        val yy = Math.min(h - 1, Math.max(0, 2 * by + dy))
+                        for (dx in 0..1) {
+                          val xx = Math.min(w - 1, 2 * bx + dx)
+                          val cxp = xx + tsx[xx]
+                          val cyp = yy + tsy[xx]
+                          if (cxp < 0 || cyp < 0 || cxp >= w || cyp >= h) {
+                            s += 255
+                            chromaAd = 255f
+                          } else {
+                            val ic = cyp * w + cxp
+                            val ir = yy * w + xx
+                            val yc = curL[ic].toInt() and 255
+                            val yr = refL[ir].toInt() and 255
+                            val d = yc - yr
+                            s += if (d < 0) -d else d
+                            if (dx == 0 && dy == 0) {
+                              val pc = cur[ic]
+                              val pr = ref[ir]
+                              var dcb = ((pc and 255) - yc) - ((pr and 255) - yr)
+                              var dcr = (((pc shr 16) and 255) - yc) - (((pr shr 16) and 255) - yr)
+                              if (dcb < 0) dcb = -dcb
+                              if (dcr < 0) dcr = -dcr
+                              chromaAd = 0.4f * (0.564f * dcb + 0.713f * dcr)
+                            }
+                          }
+                        }
+                      }
+                      val lAd = s * 0.25f
+                      adb[r * bw2 + bx] = if (chromaAd > lAd) chromaAd else lAd
+                    }
+                  }
+                  // weights per block of the strip
+                  val nb = (y1 - y0 + 1) / 2
+                  for (r in 0 until nb) {
+                    val by = y0 / 2 + r
+                    val ar = by - br0
+                    val yc = Math.min(h - 1, 2 * by + 1)
+                    nmap.fillRow(yc, w, sigRow, 0)
+                    for (bx in 0 until bw2) {
+                      var t = 0f
+                      for (dy in -1..1) {
+                        val rr = ar + dy
+                        for (dx in -1..1) {
+                          val xx = Math.min(bw2 - 1, Math.max(0, bx + dx))
+                          t += adb[rr * bw2 + xx]
+                        }
+                      }
+                      t *= (1f / 9f)
+                      val ctr = adb[ar * bw2 + bx] * 0.8f
+                      if (ctr > t) t = ctr
+                      val sg = Math.max(0.8f, sigRow[Math.min(w - 1, 2 * bx + 1)])
+                      val u = t / sg
+                      val wgt = 1f - Algo.ss(tolA, tolB, u)
+                      wq[r * bw2 + bx] = (wgt * 8f + 0.5f).toInt().toByte()
+                    }
+                  }
+                  for (y in y0 until y1) {
+                    val wr = (y / 2 - y0 / 2) * bw2
+                    for (x in 0 until w) {
+                      val wi = wq[wr + (x shr 1)].toInt()
+                      if (wi <= 0) continue
+                      val cxp = x + tsx[x]
+                      val cyp = y + tsy[x]
+                      if (cxp < 0 || cyp < 0 || cxp >= w || cyp >= h) continue
+                      val p = cur[cyp * w + cxp]
+                      val i = y * w + x
+                      val j = 3 * i
+                      sum[j] = (sum[j] + ((p shr 16) and 255) * wi).toShort()
+                      sum[j + 1] = (sum[j + 1] + ((p shr 8) and 255) * wi).toShort()
+                      sum[j + 2] = (sum[j + 2] + (p and 255) * wi).toShort()
+                      ws[i] = (ws[i] + wi).toByte()
+                      local += wi
+                    }
+                  }
+                }
+                accSum.addAndGet(local)
+              }
+              count++
+              lastAccept = accSum.get().toFloat() / (8f * n)
+              return lastAccept
+            }
+
+            // writes the merged result into the reference array and returns it
+            fun finish(): IntArray {
+              val recip = IntArray(8 * 15 + 1)
+              for (i in 1 until recip.size) recip[i] = 65536 / i
+              val next = java.util.concurrent.atomic.AtomicInteger(0)
+              val nStrips = (h + 63) / 64
+              Par.run(Par.threads()) {
+                while (true) {
+                  val s = next.getAndIncrement()
+                  if (s >= nStrips) break
+                  val a = s * 64 * w
+                  val b = Math.min(h, s * 64 + 64) * w
+                  for (i in a until b) {
+                    val wsum = ws[i].toInt() and 255
+                    val rc = recip[wsum]
+                    val j = 3 * i
+                    val r = (sum[j] * rc + 32768) shr 16
+                    val g = (sum[j + 1] * rc + 32768) shr 16
+                    val bl = (sum[j + 2] * rc + 32768) shr 16
+                    ref[i] = (255 shl 24) or (Algo.c8i(r) shl 16) or (Algo.c8i(g) shl 8) or Algo.c8i(bl)
+                  }
+                }
+              }
+              return ref
+            }
+          }
+          KT_MERGE
+          cat > app/src/main/java/com/rupom/procam/Astro.kt <<'KT_ASTRO'
+          package com.rupom.procam
+
+          // ===== astronomy / night-sky helpers (pure Kotlin, no Android APIs) =====
+          object Astro {
+            private fun dither(x: Int, y: Int): Float {
+              var hh = x * 374761393 + y * 668265263
+              hh = (hh xor (hh ushr 13)) * 1274126177
+              hh = hh xor (hh ushr 16)
+              return (hh and 255) * (1f / 255f) - 0.5f
+            }
+
+            private fun lumaAt(p: Int): Int = (((p shr 16) and 255) * 77 + ((p shr 8) and 255) * 151 + (p and 255) * 28) shr 8
+
+            // star trails: running per-channel maximum (lighten blend). acc and f must have the same size.
+            fun maxInto(acc: IntArray, f: IntArray) {
+              for (i in acc.indices) {
+                val a = acc[i]
+                val b = f[i]
+                var r = (a shr 16) and 255
+                var g = (a shr 8) and 255
+                var bl = a and 255
+                val r2 = (b shr 16) and 255
+                val g2 = (b shr 8) and 255
+                val b2 = b and 255
+                if (r2 > r) r = r2
+                if (g2 > g) g = g2
+                if (b2 > bl) bl = b2
+                acc[i] = (255 shl 24) or (r shl 16) or (g shl 8) or bl
+              }
+            }
+
+            // percentile (0..1) of a 256 bin histogram
+            private fun pct(hist: IntArray, total: Int, q: Float): Int {
+              val target = (total * q).toInt()
+              var acc = 0
+              for (i in 0..255) {
+                acc += hist[i]
+                if (acc > target) return i
+              }
+              return 255
+            }
+
+            // median luma of the frame (0..255), sampled
+            fun skyLevel(px: IntArray, w: Int, h: Int): Int {
+              val hist = IntArray(256)
+              var n = 0
+              var y = 0
+              while (y < h) {
+                var x = 0
+                while (x < w) {
+                  hist[lumaAt(px[y * w + x])]++
+                  n++
+                  x += 5
+                }
+                y += 5
+              }
+              return pct(hist, n, 0.5f)
+            }
+
+            // single-pixel hot spots (isolated, much brighter than all 8 neighbours) are replaced by the neighbour average
+            fun despeckle(px: IntArray, w: Int, h: Int) {
+              val l = Merge.luma8(px, w, h)
+              for (y in 1 until h - 1) {
+                for (x in 1 until w - 1) {
+                  val i = y * w + x
+                  val c = l[i].toInt() and 255
+                  if (c < 40) continue
+                  var mx = 0
+                  var sum = 0
+                  for (dy in -1..1) {
+                    for (dx in -1..1) {
+                      if (dx == 0 && dy == 0) continue
+                      val v = l[i + dy * w + dx].toInt() and 255
+                      sum += v
+                      if (v > mx) mx = v
+                    }
+                  }
+                  if (c - mx >= 28 && sum < 8 * 0.4f * c) {
+                    var r = 0
+                    var g = 0
+                    var b = 0
+                    for (dy in -1..1) {
+                      for (dx in -1..1) {
+                        if (dx == 0 && dy == 0) continue
+                        val p = px[i + dy * w + dx]
+                        r += (p shr 16) and 255
+                        g += (p shr 8) and 255
+                        b += p and 255
+                      }
+                    }
+                    px[i] = (255 shl 24) or ((r shr 3) shl 16) or ((g shr 3) shl 8) or (b shr 3)
+                  }
+                }
+              }
+            }
+
+            // night sky: per-channel background level (removes colour cast of the sky glow), gamma stretch, mild colour boost
+            fun skyStretch(px: IntArray, w: Int, h: Int, lift: Float, gamma: Float, sat: Float) {
+              val hr = IntArray(256)
+              val hg = IntArray(256)
+              val hb = IntArray(256)
+              var n = 0
+              var y = 0
+              while (y < h) {
+                var x = 0
+                while (x < w) {
+                  val p = px[y * w + x]
+                  hr[(p shr 16) and 255]++
+                  hg[(p shr 8) and 255]++
+                  hb[p and 255]++
+                  n++
+                  x += 3
+                }
+                y += 3
+              }
+              val bpR = pct(hr, n, 0.30f).toFloat()
+              val bpG = pct(hg, n, 0.30f).toFloat()
+              val bpB = pct(hb, n, 0.30f).toFloat()
+              val lutR = FloatArray(256)
+              val lutG = FloatArray(256)
+              val lutB = FloatArray(256)
+              for (v in 0..255) {
+                lutR[v] = lift + (255f - lift) * Math.pow(Math.max(0.0, ((v - bpR) / (255f - bpR)).toDouble()), gamma.toDouble()).toFloat()
+                lutG[v] = lift + (255f - lift) * Math.pow(Math.max(0.0, ((v - bpG) / (255f - bpG)).toDouble()), gamma.toDouble()).toFloat()
+                lutB[v] = lift + (255f - lift) * Math.pow(Math.max(0.0, ((v - bpB) / (255f - bpB)).toDouble()), gamma.toDouble()).toFloat()
+              }
+              for (y in 0 until h) {
+                for (x in 0 until w) {
+                  val i = y * w + x
+                  val p = px[i]
+                  var r = lutR[(p shr 16) and 255]
+                  var g = lutG[(p shr 8) and 255]
+                  var b = lutB[p and 255]
+                  val yv = 0.299f * r + 0.587f * g + 0.114f * b
+                  val d = dither(x, y)
+                  r = yv + (r - yv) * sat + d
+                  g = yv + (g - yv) * sat + d
+                  b = yv + (b - yv) * sat + d
+                  px[i] = (255 shl 24) or (Algo.c8(r) shl 16) or (Algo.c8(g) shl 8) or Algo.c8(b)
+                }
+              }
+            }
+
+            // moon: black sky, bright disc mapped near white, gentle contrast, mostly neutral colour
+            fun moonStretch(px: IntArray, w: Int, h: Int) {
+              val hist = IntArray(256)
+              var n = 0
+              var y = 0
+              while (y < h) {
+                var x = 0
+                while (x < w) {
+                  hist[lumaAt(px[y * w + x])]++
+                  n++
+                  x += 3
+                }
+                y += 3
+              }
+              val bp = Math.min(pct(hist, n, 0.5f) + 2, 40).toFloat()
+              val wp = Math.max(pct(hist, n, 0.998f).toFloat(), bp + 40f)
+              var scale = (246f - bp) / (wp - bp)
+              if (scale < 0.9f) scale = 0.9f
+              if (scale > 3f) scale = 3f
+              val lut = FloatArray(256)
+              for (v in 0..255) {
+                var t = (v - bp) * scale / 255f
+                if (t < 0f) t = 0f
+                if (t > 1f) t = 1f
+                val s = t * t * (3f - 2f * t)
+                lut[v] = 255f * (t + 0.25f * (s - t))
+              }
+              for (y in 0 until h) {
+                for (x in 0 until w) {
+                  val i = y * w + x
+                  val p = px[i]
+                  var r = lut[(p shr 16) and 255]
+                  var g = lut[(p shr 8) and 255]
+                  var b = lut[p and 255]
+                  val yv = 0.299f * r + 0.587f * g + 0.114f * b
+                  val d = dither(x, y)
+                  r = yv + (r - yv) * 0.45f + d
+                  g = yv + (g - yv) * 0.45f + d
+                  b = yv + (b - yv) * 0.45f + d
+                  px[i] = (255 shl 24) or (Algo.c8(r) shl 16) or (Algo.c8(g) shl 8) or Algo.c8(b)
+                }
+              }
+            }
+
+            // clockwise rotation of an image by 0 / 90 / 180 / 270 degrees (same as Matrix.postRotate)
+            fun rotateInts(px: IntArray, w: Int, h: Int, rot: Int): IntArray {
+              val r = ((rot % 360) + 360) % 360
+              if (r == 0) return px
+              val o = IntArray(w * h)
+              if (r == 90) {
+                for (y in 0 until h) for (x in 0 until w) o[x * h + (h - 1 - y)] = px[y * w + x]
+              } else if (r == 180) {
+                for (y in 0 until h) for (x in 0 until w) o[(h - 1 - y) * w + (w - 1 - x)] = px[y * w + x]
+              } else {
+                for (y in 0 until h) for (x in 0 until w) o[(w - 1 - x) * h + y] = px[y * w + x]
+              }
+              return o
+            }
+          }
+          KT_ASTRO
+          cat > app/src/main/java/com/rupom/procam/Plan.kt <<'KT_PLAN'
+          package com.rupom.procam
+
+          // ===== exposure planning for Enhanced / Astro bursts (pure Kotlin, no Android APIs) =====
+          class BurstPlan(
+            val frames: Int,
+            val expNs: Long,
+            val iso: Int,
+            val manual: Boolean,
+            val note: String
+          )
+
+          object Plan {
+            private fun clampL(v: Long, lo: Long, hi: Long): Long = if (v < lo) lo else if (v > hi) hi else v
+            private fun clampI(v: Int, lo: Int, hi: Int): Int = if (v < lo) lo else if (v > hi) hi else v
+
+            // exposure times that are whole multiples of the mains-light flicker period (100 Hz / 120 Hz):
+            // 50 ms steps from 50 ms up, 10 ms steps from 20 ms up, shorter ones unchanged. Only ever rounds down.
+            fun flickerSafe(ns: Long): Long {
+              val ms = ns / 1_000_000L
+              if (ms >= 50L) return (ms / 50L) * 50L * 1_000_000L
+              if (ms >= 20L) return (ms / 10L) * 10L * 1_000_000L
+              return ns
+            }
+
+            // Enhanced Photo. aeNs/aeIso = exposure the camera's own auto exposure uses right now (brightness reference),
+            // omega = gyro angular speed in rad/s (negative = unknown), totalSec = wanted capture time (0 = automatic).
+            fun enhanced(
+              aeNs: Long, aeIso: Int, omega: Float, hasOis: Boolean, totalSec: Float,
+              isoLo: Int, isoHi: Int, tLo: Long, tHi: Long, manualOk: Boolean
+            ): BurstPlan {
+              if (!manualOk || aeNs <= 0L || aeIso <= 0) return BurstPlan(8, 0L, 0, false, "auto")
+              val e = aeNs.toDouble() * aeIso.toDouble()
+              val om = if (omega < 0f) 0.05 else omega.toDouble()
+              val oe = Math.max(0.0015, om * (if (hasOis) 0.4 else 1.0))
+              // blur budget about 2-3 px on a 4000 px wide frame -> longest frame time the hand shake allows
+              var tf = 0.0009 / oe * 1.0e9
+              val cap = if (oe < 0.006) 500_000_000.0 else 250_000_000.0
+              tf = Math.max(1.0e9 / 60.0, Math.min(cap, tf))
+              // very dim scene: reach the brightness of the auto exposure even if that costs some sharpness
+              val tDim = e / isoHi.toDouble()
+              if (tf < tDim) tf = Math.min(cap, tDim)
+              // bright scene: a longer frame would over-expose even at the lowest ISO
+              val tBright = e / isoLo.toDouble()
+              var bright = false
+              if (tf >= tBright) {
+                tf = tBright
+                bright = true
+              }
+              var t = clampL(tf.toLong(), tLo, tHi)
+              if (!bright) {
+                val fs = flickerSafe(t)
+                if (fs >= tLo) t = fs
+              }
+              val iso = clampI(Math.round(e / t.toDouble()).toInt(), isoLo, isoHi)
+              val total = if (totalSec > 0f) totalSec.toDouble() else if (aeIso >= 800) 2.0 else if (aeIso >= 300) 1.5 else 1.0
+              var n = Math.round(total * 1.0e9 / t.toDouble()).toInt()
+              if (bright) n = Math.min(n, 5)
+              n = clampI(n, 3, 12)
+              return BurstPlan(n, t, iso, true, if (bright) "bright" else "dim")
+            }
+
+            // Moon: the "Looney 11" rule (f/11 at 1/ISO s for a full moon) scaled to the lens aperture, lowest ISO.
+            fun moon(aperture: Float, isoLo: Int, tLo: Long, tHi: Long): BurstPlan {
+              val ap = if (aperture > 0.5f) aperture.toDouble() else 1.8
+              val iso = Math.max(isoLo, 1)
+              val sec = ap * ap / 121.0 / iso.toDouble()
+              val t = clampL((sec * 1.0e9).toLong(), tLo, tHi)
+              return BurstPlan(8, t, iso, true, "moon")
+            }
+
+            // first (test) frame of Stars / Trails, only used to measure how bright the sky glow is
+            fun skyTrial(isoLo: Int, isoHi: Int, tLo: Long, tHi: Long): BurstPlan {
+              val t = clampL(1_000_000_000L, tLo, tHi)
+              val iso = clampI(1600, isoLo, isoHi)
+              return BurstPlan(1, t, iso, true, "meter")
+            }
+
+            // exposure per frame for the sky, from the trial frame: skyLuma = median luma (0..255) of the trial.
+            // returns [exposure ns, iso]
+            fun skyExposure(
+              trialNs: Long, trialIso: Int, skyLuma: Int, tripod: Boolean, tfMaxNs: Long,
+              isoLo: Int, isoHi: Int, tLo: Long, tHi: Long, target: Int
+            ): LongArray {
+              val v = Math.max(2, skyLuma)
+              var r = Math.pow(target.toDouble() / v.toDouble(), 2.2)
+              r = Math.max(0.05, Math.min(60.0, r))
+              val eT = trialNs.toDouble() * trialIso.toDouble() * r
+              val capNs = if (tripod) tfMaxNs else Math.min(tfMaxNs, 250_000_000L)
+              var t = clampL(capNs, tLo, tHi).toDouble()
+              var iso = eT / t
+              val isoCap = Math.max(isoLo, Math.min(isoHi, 3200)).toDouble()
+              if (iso < isoLo) {
+                iso = isoLo.toDouble()
+                t = Math.max(tLo.toDouble(), Math.min(t, eT / isoLo))
+              }
+              if (iso > isoCap) iso = isoCap
+              return longArrayOf(clampL(t.toLong(), tLo, tHi), Math.round(iso))
+            }
+
+            fun starsFrames(totalSec: Float, tNs: Long, maxFrames: Int): Int =
+              clampI(Math.round(totalSec.toDouble() * 1.0e9 / tNs.toDouble()).toInt(), 3, maxFrames)
+
+            // Trails: frames follow each other with a short dead time (about 0.6 s per frame on a phone)
+            fun trailsFrames(minutes: Float, tNs: Long, maxFrames: Int): Int {
+              val per = tNs.toDouble() / 1.0e9 + 0.6
+              return clampI(Math.round(minutes.toDouble() * 60.0 / per).toInt(), 5, maxFrames)
+            }
+          }
+          KT_PLAN
           cat > app/src/main/java/com/rupom/procam/MainActivity.kt <<'EOF'
           package com.rupom.procam
 
@@ -105,10 +1634,21 @@ jobs:
           import android.graphics.Matrix
           import android.graphics.Color
           import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.PathMeasure
+          import android.graphics.RectF
+          import android.graphics.Typeface
           import android.graphics.Rect
           import android.graphics.drawable.GradientDrawable
+          import android.hardware.Sensor
+          import android.hardware.SensorEvent
+          import android.hardware.SensorEventListener
+          import android.hardware.SensorManager
+          import android.hardware.camera2.CameraCaptureSession
           import android.hardware.camera2.CameraCharacteristics
           import android.hardware.camera2.CaptureRequest
+          import android.hardware.camera2.CaptureResult
+          import android.hardware.camera2.TotalCaptureResult
           import android.hardware.camera2.params.TonemapCurve
           import android.net.Uri
           import android.os.Bundle
@@ -147,6 +1687,7 @@ jobs:
           import com.google.mlkit.vision.segmentation.Segmentation
           import com.google.mlkit.vision.segmentation.selfie.SelfieSegmenterOptions
           import java.io.ByteArrayOutputStream
+          import java.util.concurrent.LinkedBlockingQueue
           import androidx.camera.lifecycle.ProcessCameraProvider
           import androidx.camera.video.*
           import androidx.camera.view.PreviewView
@@ -262,6 +1803,170 @@ jobs:
             }
           }
 
+          class BFrame(val bytes: ByteArray, val omega: Float, val rot: Int, val kind: Int)
+
+          // clock-like progress ring drawn around the shutter button
+          class RingView(c: Context) : View(c) {
+            private val dn = c.resources.displayMetrics.density
+            private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+            private val rect = RectF()
+            private var prog = 0f
+            private var anim: ValueAnimator? = null
+            private val accent = Color.parseColor("#FF2D4B")
+
+            fun reset() {
+              anim?.cancel()
+              prog = 0f
+              invalidate()
+            }
+
+            fun sweep(to: Float, ms: Long) {
+              anim?.cancel()
+              val a = ValueAnimator.ofFloat(prog, to)
+              a.duration = Math.max(60L, ms)
+              a.interpolator = android.view.animation.LinearInterpolator()
+              a.addUpdateListener { v ->
+                prog = v.animatedValue as Float
+                invalidate()
+              }
+              anim = a
+              a.start()
+            }
+
+            override fun onDraw(cv: Canvas) {
+              val w = width.toFloat()
+              val h = height.toFloat()
+              val cx = w / 2f
+              val cy = h / 2f
+              val sw = 4f * dn
+              val r = Math.min(w, h) / 2f - 6f * dn
+              p.style = Paint.Style.STROKE
+              p.strokeWidth = sw
+              p.strokeCap = Paint.Cap.BUTT
+              p.color = Color.argb(70, 255, 255, 255)
+              cv.drawCircle(cx, cy, r, p)
+              // twelve clock ticks outside the ring
+              p.strokeWidth = 1.5f * dn
+              for (i in 0 until 12) {
+                val on = prog * 12f > i + 0.01f
+                p.color = if (on) accent else Color.argb(110, 255, 255, 255)
+                cv.save()
+                cv.rotate(i * 30f, cx, cy)
+                cv.drawLine(cx, cy - r - sw / 2f - 1.5f * dn, cx, cy - r - sw / 2f - 4f * dn, p)
+                cv.restore()
+              }
+              if (prog > 0.001f) {
+                p.strokeWidth = sw
+                p.strokeCap = Paint.Cap.ROUND
+                p.color = accent
+                rect.set(cx - r, cy - r, cx + r, cy + r)
+                cv.drawArc(rect, -90f, 360f * Math.min(1f, prog), false, p)
+              }
+            }
+          }
+
+          // startup animation: "Pro Cam", then "Created by Rupom" written like a signature
+          class IntroView(c: Context) : View(c) {
+            var t = 0f
+            private val dn = c.resources.displayMetrics.density
+            private val pTitle = Paint(Paint.ANTI_ALIAS_FLAG)
+            private val pStroke = Paint(Paint.ANTI_ALIAS_FLAG)
+            private val pFill = Paint(Paint.ANTI_ALIAS_FLAG)
+            private val pSub = Paint(Paint.ANTI_ALIAS_FLAG)
+            private val sig = Path()
+            private val seg = Path()
+            private val rf = RectF()
+            private var sigLen = 0f
+            private var built = false
+            private val sigText = "Created by Rupom"
+
+            init {
+              pTitle.color = Color.WHITE
+              pTitle.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.BOLD)
+              pTitle.textAlign = Paint.Align.CENTER
+              pTitle.textSize = 44f * dn
+              pTitle.letterSpacing = 0.08f
+              pSub.color = Color.parseColor("#FF2D4B")
+              pSub.textAlign = Paint.Align.CENTER
+              pSub.textSize = 12f * dn
+              pSub.letterSpacing = 0.5f
+              pSub.typeface = Typeface.create(Typeface.SANS_SERIF, Typeface.NORMAL)
+              pStroke.style = Paint.Style.STROKE
+              pStroke.strokeWidth = 1.6f * dn
+              pStroke.strokeCap = Paint.Cap.ROUND
+              pStroke.strokeJoin = Paint.Join.ROUND
+              pStroke.color = Color.parseColor("#FF5C72")
+              pFill.style = Paint.Style.FILL
+              pFill.color = Color.parseColor("#FF5C72")
+            }
+
+            private fun build() {
+              built = true
+              val tp = Paint(Paint.ANTI_ALIAS_FLAG)
+              tp.typeface = Typeface.create("cursive", Typeface.ITALIC)
+              tp.textSize = 40f * dn
+              val raw = Path()
+              tp.getTextPath(sigText, 0, sigText.length, 0f, 0f, raw)
+              raw.computeBounds(rf, true)
+              val bw = rf.width()
+              if (bw < 1f) return
+              val s = Math.min(1.6f, (width * 0.62f) / bw)
+              val m = Matrix()
+              m.postTranslate(-rf.left, -rf.bottom)
+              m.postScale(s, s)
+              m.postTranslate((width - bw * s) / 2f, height * 0.5f + 62f * dn)
+              raw.transform(m, sig)
+              // underline flourish, drawn last
+              val x0 = (width - bw * s) / 2f
+              val x1 = x0 + bw * s
+              val yb = height * 0.5f + 62f * dn + 9f * dn
+              sig.moveTo(x0 + 6f * dn, yb)
+              sig.cubicTo(x0 + (x1 - x0) * 0.30f, yb + 7f * dn, x0 + (x1 - x0) * 0.62f, yb - 6f * dn, x1, yb - 2f * dn)
+              val pm = PathMeasure(sig, false)
+              var tot = pm.length
+              while (pm.nextContour()) tot += pm.length
+              sigLen = tot
+            }
+
+            private fun ss(a: Float, b: Float, x: Float): Float {
+              val u = ((x - a) / (b - a)).coerceIn(0f, 1f)
+              return u * u * (3f - 2f * u)
+            }
+
+            override fun onDraw(cv: Canvas) {
+              val w = width.toFloat()
+              val h = height.toFloat()
+              if (!built && width > 0) build()
+              val a = ss(0f, 0.34f, t)
+              cv.save()
+              val k = 0.88f + 0.12f * a
+              cv.scale(k, k, w / 2f, h * 0.5f)
+              pTitle.alpha = (255f * a).toInt()
+              cv.drawText("Pro Cam", w / 2f, h * 0.5f - 6f * dn, pTitle)
+              cv.restore()
+              pSub.alpha = (200f * ss(0.1f, 0.4f, t)).toInt()
+              cv.drawText("CAMERA", w / 2f, h * 0.5f + 22f * dn, pSub)
+              val sp = ss(0.30f, 0.92f, t)
+              if (sp > 0f && sigLen > 0f) {
+                var remain = sp * sigLen
+                val pm = PathMeasure(sig, false)
+                do {
+                  if (remain <= 0f) break
+                  val len = pm.length
+                  seg.reset()
+                  pm.getSegment(0f, Math.min(len, remain), seg, true)
+                  cv.drawPath(seg, pStroke)
+                  remain -= len
+                } while (pm.nextContour())
+              }
+              val fa = ss(0.82f, 1f, t)
+              if (fa > 0f) {
+                pFill.alpha = (255f * fa).toInt()
+                cv.drawPath(sig, pFill)
+              }
+            }
+          }
+
           class MainActivity : ComponentActivity() {
             private val RED = Color.parseColor("#FF2D4B")
             private val DARK = Color.parseColor("#2A2236")
@@ -364,7 +2069,54 @@ jobs:
             private val beautyNames = arrayOf("Off", "Basic", "Medium", "Strong")
             private val sharpNames = arrayOf("Off", "Low", "Medium", "High")
             private var hwBokeh = false
-            private val modeIds = intArrayOf(0, 3, 1, 2)
+            private val modeIds = intArrayOf(0, 4, 3, 5, 1, 2)
+            private var enhTimeIdx = 0
+            private val enhTimeNames = arrayOf("Auto", "1 s", "1.5 s", "2 s")
+            private val enhTimeVals = floatArrayOf(0f, 1f, 1.5f, 2f)
+            private var astroSub = 1
+            private val astroNames = arrayOf("Moon", "Stars", "Trails")
+            private var starSecIdx = 1
+            private val starSecNames = arrayOf("20 s", "30 s", "60 s")
+            private val starSecVals = floatArrayOf(20f, 30f, 60f)
+            private var trailMinIdx = 1
+            private val trailMinNames = arrayOf("1 min", "2 min", "5 min", "10 min")
+            private val trailMinVals = floatArrayOf(1f, 2f, 5f, 10f)
+            private var introOn = true
+            private lateinit var ring: RingView
+            private lateinit var modeScroll: HorizontalScrollView
+            // camera facts used by Enhanced / Astro
+            private var hasOis = false
+            private var manualCap = false
+            private var expLo = 100_000L
+            private var expHi = 100_000_000L
+            private var maxFrameNs = 0L
+            private var apertureF = 0f
+            private var minFocus = 0f
+            // live data
+            @Volatile private var aeNs = 0L
+            @Volatile private var aeIso = 0
+            @Volatile private var focusDist = -1f
+            @Volatile private var omegaFast = -1f
+            @Volatile private var omegaSlow = -1f
+            private var sm: SensorManager? = null
+            private var gyroOn = false
+            // burst engine state
+            private val heavy = Any()
+            @Volatile private var procBusy = false
+            private var burstOn = false
+            private var burstStopReq = false
+            private var burstInFlight = false
+            private var burstMeter = false
+            private var burstTripod = false
+            private var burstFocusLock = false
+            private var burstSub = 0
+            private var burstZ = 1f
+            private var burstDone = 0
+            private var burstErrors = 0
+            private var burstT0 = 0L
+            private var burstMaxOmega = 0f
+            private var burstPlan: BurstPlan? = null
+            private var burstQ: LinkedBlockingQueue<BFrame>? = null
             private val vNames = arrayOf("16:9", "4:3", "Cinematic", "1:1")
             private val hideToast = Runnable { reveal(toastV, false) }
             private lateinit var zoomLabel: TextView
@@ -456,6 +2208,21 @@ jobs:
 
             private fun buildRatioRow() {
               ratioRow.removeAllViews()
+              if (mode == 5) {
+                for (i in astroNames.indices) {
+                  val c = chip(astroNames[i]) {
+                    if (!burstOn && !counting && astroSub != i) {
+                      astroSub = i
+                      buildRatioRow()
+                      astroZoomPreset()
+                      saveSettings()
+                    }
+                  }
+                  mark(c, i == astroSub)
+                  ratioRow.addView(c, lp(-2, -2, 3))
+                }
+                return
+              }
               val names = if (mode == 1) vNames else if (mode == 3) arrayOf("1.5x", "3x") else arrayOf("4:3", "16:9")
               val sel = if (mode == 1) vRatio else if (mode == 3) (if (portraitZoom >= 3f) 1 else 0) else if (ratio169) 1 else 0
               for (i in names.indices) {
@@ -464,7 +2231,7 @@ jobs:
                     portraitZoom = if (i == 1) 3f else 1.5f
                     zoomTo(portraitZoom)
                     buildRatioRow()
-                  } else if (recording == null && !counting) {
+                  } else if (recording == null && !counting && !burstOn) {
                     if (mode == 1) vRatio = i else ratio169 = (i == 1)
                     updateResChip()
                     refreshers.forEach { it() }
@@ -474,6 +2241,17 @@ jobs:
                 }
                 mark(c, i == sel)
                 ratioRow.addView(c, lp(-2, -2, 3))
+              }
+              if (mode == 4) {
+                val tc = chip("\u23F1 " + enhTimeNames[enhTimeIdx]) { v ->
+                  if (!burstOn) {
+                    enhTimeIdx = (enhTimeIdx + 1) % enhTimeNames.size
+                    v.text = "\u23F1 " + enhTimeNames[enhTimeIdx]
+                    refreshers.forEach { it() }
+                    saveSettings()
+                  }
+                }
+                ratioRow.addView(tc, lp(-2, -2, 3))
               }
             }
 
@@ -541,7 +2319,7 @@ jobs:
                 v.text = if (timerSec == 0) "⏱ Off" else "⏱ ${timerSec}s"
               }
               resChip = chip("4:3") {
-                if (recording == null) {
+                if (recording == null && !burstOn) {
                   if (mode == 1) resIdx = (resIdx + 1) % resN.size else ratio169 = !ratio169
                   updateResChip()
                   refreshers.forEach { it() }
@@ -713,13 +2491,18 @@ jobs:
               val strip = LinearLayout(this)
               strip.orientation = LinearLayout.HORIZONTAL
               strip.gravity = Gravity.CENTER
-              val names = arrayOf("PHOTO", "PORTRAIT", "VIDEO", "PRO")
+              val names = arrayOf("PHOTO", "ENHANCED", "PORTRAIT", "ASTRO", "VIDEO", "PRO")
               for (i in names.indices) {
                 val c = chip(names[i]) { setMode(modeIds[i]) }
                 modeChips.add(c)
                 strip.addView(c, lp(-2, -2, 4))
               }
-              main.addView(strip, lp(-1, -2, 2))
+              modeScroll = HorizontalScrollView(this)
+              modeScroll.isHorizontalScrollBarEnabled = false
+              modeScroll.isFillViewport = true
+              modeScroll.overScrollMode = View.OVER_SCROLL_NEVER
+              modeScroll.addView(strip, FrameLayout.LayoutParams(-2, -2))
+              main.addView(modeScroll, lp(-1, -2, 2))
 
               val ctl = FrameLayout(this)
               thumb = ImageView(this)
@@ -731,6 +2514,9 @@ jobs:
               val tlp = FrameLayout.LayoutParams(dp(54), dp(54), Gravity.START or Gravity.CENTER_VERTICAL)
               tlp.leftMargin = dp(24)
               ctl.addView(thumb, tlp)
+              ring = RingView(this)
+              ring.visibility = View.GONE
+              ctl.addView(ring, FrameLayout.LayoutParams(dp(98), dp(98), Gravity.CENTER))
               shutter = View(this)
               shutter.setOnClickListener { onShutter() }
               press(shutter)
@@ -746,7 +2532,7 @@ jobs:
               pauseChip.translationX = -dp(104).toFloat()
               val flip = chip("⟳ Flip") {
                 if (recording != null) { pendingFlip = true; recording?.stop() }
-                else if (!counting) { back = !back; rebind() }
+                else if (!counting && !burstOn) { back = !back; rebind() }
               }
               right.addView(flip, lp(-2, -2, 3))
               val rlp = FrameLayout.LayoutParams(-2, -2, Gravity.END or Gravity.CENTER_VERTICAL)
@@ -782,6 +2568,7 @@ jobs:
                 gridOn = !gridOn
                 grid.visibility = if (gridOn) View.VISIBLE else View.GONE
               }
+              setting(common, "Startup Animation", { if (introOn) "On" else "Off" }) { introOn = !introOn }
               setting(common, "Display Refresh Rate", { if (maxHz) "Auto (max ${hzMax}Hz)" else "60Hz" }) {
                 maxHz = !maxHz
                 applyRefresh()
@@ -809,6 +2596,12 @@ jobs:
               setting(photoBox, "Beautification", { beautyNames[beautyLv] }) { beautyLv = (beautyLv + 1) % beautyNames.size }
               setting(photoBox, "Smart Color", { if (colBoost) "On" else "Off" }) { colBoost = !colBoost }
               setting(photoBox, "Portrait Blur", { apNames[apIdx] }) { apIdx = (apIdx + 1) % apNames.size }
+              setting(photoBox, "Enhanced Capture Time", { enhTimeNames[enhTimeIdx] }) {
+                enhTimeIdx = (enhTimeIdx + 1) % enhTimeNames.size
+                if (mode == 4) buildRatioRow()
+              }
+              setting(photoBox, "Astro Stars Duration", { starSecNames[starSecIdx] }) { starSecIdx = (starSecIdx + 1) % starSecNames.size }
+              setting(photoBox, "Astro Trails Duration", { trailMinNames[trailMinIdx] }) { trailMinIdx = (trailMinIdx + 1) % trailMinNames.size }
               setting(videoBox, "Aspect Ratio", { vNames[vRatio] }) {
                 vRatio = (vRatio + 1) % vNames.size
                 buildRatioRow()
@@ -850,6 +2643,10 @@ jobs:
                 sharpLv = 2
                 colBoost = true
                 apIdx = 1
+                enhTimeIdx = 0
+                starSecIdx = 1
+                trailMinIdx = 1
+                introOn = true
                 maxHz = true
                 applyRefresh()
                 refreshers.forEach { it() }
@@ -860,8 +2657,12 @@ jobs:
               settingsView.addView(settingsBox)
               root.addView(settingsView, FrameLayout.LayoutParams(-1, -1))
               setContentView(root)
-              root.alpha = 0f
-              root.animate().alpha(1f).setDuration(450).start()
+              if (introOn) {
+                startIntro(root)
+              } else {
+                root.alpha = 0f
+                root.animate().alpha(1f).setDuration(450).start()
+              }
               setMode(0)
               applyRefresh()
               loadLastThumb()
@@ -890,6 +2691,11 @@ jobs:
               colBoost = p.getBoolean("colBoost", colBoost)
               apIdx = p.getInt("apIdx", apIdx).coerceIn(0, 3)
               maxHz = p.getBoolean("maxHz", maxHz)
+              enhTimeIdx = p.getInt("enhTimeIdx", enhTimeIdx).coerceIn(0, 3)
+              astroSub = p.getInt("astroSub", astroSub).coerceIn(0, 2)
+              starSecIdx = p.getInt("starSecIdx", starSecIdx).coerceIn(0, 2)
+              trailMinIdx = p.getInt("trailMinIdx", trailMinIdx).coerceIn(0, 3)
+              introOn = p.getBoolean("introOn", introOn)
             }
 
             private fun saveSettings() {
@@ -911,6 +2717,11 @@ jobs:
                 .putBoolean("colBoost", colBoost)
                 .putInt("apIdx", apIdx)
                 .putBoolean("maxHz", maxHz)
+                .putInt("enhTimeIdx", enhTimeIdx)
+                .putInt("astroSub", astroSub)
+                .putInt("starSecIdx", starSecIdx)
+                .putInt("trailMinIdx", trailMinIdx)
+                .putBoolean("introOn", introOn)
                 .apply()
             }
 
@@ -964,11 +2775,17 @@ jobs:
             override fun onResume() {
               super.onResume()
               if (!camStarted && checkSelfPermission(Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
+              if (mode == 4 || mode == 5) gyroSet(true)
             }
 
             override fun onStop() {
               super.onStop()
               saveSettings()
+              gyroSet(false)
+              if (burstOn) {
+                burstStopReq = true
+                if (!burstInFlight) burstFinish()
+              }
               if (counting) {
                 counting = false
                 handler.removeCallbacksAndMessages(null)
@@ -1040,6 +2857,7 @@ jobs:
             }
 
             private fun zoomTo(r: Float, dial: Boolean = false) {
+              if (burstOn) return
               zTarget = r.coerceIn(zmin, zmax)
               if (dial) showDial()
               if (!zRunning) { zRunning = true; pv.postOnAnimation(zoomStep) }
@@ -1127,6 +2945,10 @@ jobs:
             }
 
             private fun openSettings() {
+              if (burstOn) {
+                toast("Busy, wait for the shot to finish")
+                return
+              }
               if (expOpen) setPanel(false)
               val v = mode == 1
               settingsTitle.text = if (v) "←  Video Settings" else "←  Photo Settings"
@@ -1143,7 +2965,7 @@ jobs:
             }
 
             private fun updateShutter() {
-              val rec = recording != null
+              val rec = recording != null || burstOn
               val red = mode == 1 || rec
               shutter.background = bg(if (red) RED else Color.WHITE, if (rec) 18 else 38, if (red) Color.WHITE else RED, 5)
               shutter.animate().scaleX(if (rec) 0.88f else 1f).scaleY(if (rec) 0.88f else 1f).setDuration(220).start()
@@ -1159,11 +2981,19 @@ jobs:
             }
 
             private fun setMode(m: Int) {
-              if (recording != null || counting) return
+              if (recording != null || counting || burstOn) return
               mode = m
               if (m != 2) { manExp = false; manWb = false; wasManual = false }
               for (i in modeChips.indices) mark(modeChips[i], modeIds[i] == m)
+              val mi = modeIds.indexOf(m)
+              if (mi >= 0 && mi < modeChips.size) {
+                val cc = modeChips[mi]
+                modeScroll.post { modeScroll.smoothScrollTo(cc.left + cc.width / 2 - modeScroll.width / 2, 0) }
+              }
               reveal(proPanel, m == 2)
+              ring.reset()
+              ring.visibility = if (m == 4 || m == 5) View.VISIBLE else View.GONE
+              gyroSet(m == 4 || m == 5)
               buildRatioRow()
               updateResChip()
               updateShutter()
@@ -1184,6 +3014,7 @@ jobs:
             }
 
             private fun tapFocus(x: Float, y: Float) {
+              if (burstOn) return
               val pt = pv.meteringPointFactory.createPoint(x, y)
               camera?.cameraControl?.startFocusAndMetering(FocusMeteringAction.Builder(pt).build())
               focusBox.animate().cancel()
@@ -1219,7 +3050,10 @@ jobs:
 
             private fun rebind() {
               val p = provider ?: return
+              if (burstOn) return
               p.unbindAll()
+              aeNs = 0L
+              aeIso = 0
               fadePreview()
               img = null
               vc = null
@@ -1231,6 +3065,7 @@ jobs:
                 pb.setTargetFrameRate(range)
                 Camera2Interop.Extender(pb).setCaptureRequestOption(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, range)
               }
+              if (mode == 4 || mode == 5) Camera2Interop.Extender(pb).setSessionCaptureCallback(aeWatch)
               val preview = pb.build()
               preview.setSurfaceProvider(pv.surfaceProvider)
               prev = preview
@@ -1278,8 +3113,8 @@ jobs:
                 zRunning = false
                 lastSel = -2
                 syncZoomUI()
-                if (mode == 3) zoomTo(portraitZoom)
-                info.text = if (mode == 1) resN[resIdx] + (if (rawVideo) " RAW" else "") else if (mode == 3) (if (hwBokeh) "Portrait: hardware blur" else "Portrait: software blur") else ""
+                if (mode == 3) zoomTo(portraitZoom) else if (mode == 5 && astroSub == 0) zoomTo(Math.min(zmax, 8f))
+                info.text = modeInfo()
               } catch (e: Exception) {
                 if (mode == 1 && resF[resIdx] == 60) {
                   resIdx += 1
@@ -1308,6 +3143,17 @@ jobs:
                 val ir = ci.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
                 if (ir != null) { isoLo = ir.lower; isoHi = minOf(ir.upper, 6400) }
                 val tr = ci.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+                if (tr != null) {
+                  expLo = tr.lower
+                  expHi = tr.upper
+                }
+                hasOis = ci.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                  ?.contains(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON) == true
+                manualCap = ci.getCameraCharacteristic(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                  ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR) == true
+                maxFrameNs = ci.getCameraCharacteristic(CameraCharacteristics.SENSOR_INFO_MAX_FRAME_DURATION) ?: 0L
+                apertureF = ci.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)?.firstOrNull() ?: 0f
+                minFocus = ci.getCameraCharacteristic(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
                 val dens = listOf(8000, 4000, 2000, 1000, 500, 250, 125, 60, 30, 15, 8, 4)
                 val fps = resF[resIdx]
                 shDen = dens.filter { d ->
@@ -1319,6 +3165,8 @@ jobs:
               } catch (e: Exception) {
                 shDen = listOf()
                 hdrOk = false
+                hasOis = false
+                manualCap = false
               }
               shSb.max = maxOf(shDen.size - 1, 0)
               shSb.progress = shDen.indexOf(125).coerceAtLeast(0)
@@ -1330,7 +3178,7 @@ jobs:
               refreshPro()
             }
 
-            private fun flatOn(): Boolean = if (mode == 1) rawVideo else (rawPhoto && mode != 3)
+            private fun flatOn(): Boolean = if (mode == 1) rawVideo else (rawPhoto && (mode == 0 || mode == 2))
 
             private fun flatY(x: Float): Float {
               val s = if (x <= 0.0031308f) 12.92f * x else (1.055 * Math.pow(x.toDouble(), 1.0 / 2.4) - 0.055).toFloat()
@@ -1399,7 +3247,11 @@ jobs:
               if (counting) {
                 counting = false
                 handler.removeCallbacksAndMessages(null)
-                info.text = ""
+                info.text = modeInfo()
+                return
+              }
+              if (burstOn) {
+                burstStop()
                 return
               }
               if (mode == 1) {
@@ -1407,8 +3259,12 @@ jobs:
                 if (r != null) { r.stop(); return }
                 if (timerSec > 0) { counting = true; countdown(timerSec) { startRec() } } else startRec()
               } else {
-                if (timerSec > 0) { counting = true; countdown(timerSec) { takePhoto() } } else takePhoto()
+                if (timerSec > 0) { counting = true; countdown(timerSec) { shootNow() } } else shootNow()
               }
+            }
+
+            private fun shootNow() {
+              if (mode == 4 || mode == 5) burstStart() else takePhoto()
             }
 
             private fun countdown(n: Int, done: () -> Unit) {
@@ -1438,7 +3294,7 @@ jobs:
                   buf.get(bytes)
                   val rot = image.imageInfo.rotationDegrees
                   image.close()
-                  if (!(rawPhoto && mode != 3)) toast("Processing...")
+                  if (!(rawPhoto && (mode == 0 || mode == 2))) toast("Processing...")
                   Thread { processAndSave(bytes, rot, z, mode) }.start()
                 }
                 override fun onError(e: ImageCaptureException) { toast("Error: ${e.message}") }
@@ -1448,78 +3304,591 @@ jobs:
             private fun processAndSave(bytes: ByteArray, rot: Int, z: Float, md: Int) {
               try {
                 var out = bytes
-                val raw = rawPhoto && md != 3
+                val raw = rawPhoto && (md == 0 || md == 2)
                 if (!raw) {
-                  val o = BitmapFactory.Options()
-                  o.inJustDecodeBounds = true
-                  BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
-                  var ss = 1
-                  val limit = if (md == 3) 3200 else 4200
-                  while (Math.max(o.outWidth, o.outHeight) / ss > limit) ss *= 2
-                  val o2 = BitmapFactory.Options()
-                  o2.inSampleSize = ss
-                  var bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o2) ?: return
-                  if (rot != 0) {
-                    val mx = Matrix()
-                    mx.postRotate(rot.toFloat())
-                    bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, mx, true)
+                  synchronized(heavy) {
+                    var bmp = decodeLimited(bytes, sizeLimit(md)) ?: return
+                    if (rot != 0) {
+                      val mx = Matrix()
+                      mx.postRotate(rot.toFloat())
+                      val rb = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, mx, true)
+                      if (rb !== bmp) bmp.recycle()
+                      bmp = rb
+                    }
+                    val usePortrait = md == 3 && !hwBokeh
+                    val faces = if (usePortrait || (procOn && beautyLv > 0)) detectFaces(bmp) else emptyList<Rect>()
+                    if (usePortrait) {
+                      val r = try { portrait(bmp, faces) } catch (e: Throwable) { null }
+                      if (r != null) {
+                        bmp.recycle()
+                        bmp = r
+                      } else runOnUiThread { toast("No person found, saved without blur") }
+                    }
+                    val w = bmp.width
+                    val h = bmp.height
+                    val px = IntArray(w * h)
+                    bmp.getPixels(px, 0, w, 0, 0, w, h)
+                    bmp.recycle()
+                    out = jpegOf(enhanceInts(px, w, h, photoParams(z), faces), w, h)
                   }
-                  val usePortrait = md == 3 && !hwBokeh
-                  val faces = if (usePortrait || (procOn && beautyLv > 0)) detectFaces(bmp) else emptyList<Rect>()
-                  if (usePortrait) {
-                    val r = try { portrait(bmp, faces) } catch (e: Throwable) { null }
-                    if (r != null) bmp = r else runOnUiThread { toast("No person found, saved without blur") }
-                  }
-                  bmp = enhance(bmp, procLevel, z > 1.9f, faces, !procOn)
-                  val bos = ByteArrayOutputStream()
-                  bmp.compress(Bitmap.CompressFormat.JPEG, 95, bos)
-                  out = bos.toByteArray()
                 }
-                val cv = ContentValues()
-                cv.put(MediaStore.Images.Media.DISPLAY_NAME, "ProCam_${System.currentTimeMillis()}")
-                cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                cv.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ProCam")
-                val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
-                if (uri != null) contentResolver.openOutputStream(uri)?.use { it.write(out) }
-                runOnUiThread { saved(uri, "image/*", if (raw) "RAW Photo Saved" else if (md == 3) "Portrait Saved" else "Photo Saved") }
+                saveJpeg(out, if (raw) "RAW Photo Saved" else if (md == 3) "Portrait Saved" else "Photo Saved")
               } catch (e: Throwable) {
                 runOnUiThread { toast("Error: ${e.message}") }
               }
             }
 
-            private fun c8(v: Float): Int = if (v < 0f) 0 else if (v > 255f) 255 else v.toInt()
-
-            private fun blur1d(src: IntArray, dst: IntArray, lines: Int, len: Int, ls: Int, es: Int, r: Int) {
-              val div = 2 * r + 1
-              for (l in 0 until lines) {
-                val o = l * ls
-                var sr = 0
-                var sg = 0
-                var sb = 0
-                for (i in -r..r) {
-                  val p = src[o + i.coerceIn(0, len - 1) * es]
-                  sr += (p shr 16) and 255
-                  sg += (p shr 8) and 255
-                  sb += p and 255
+            // ---------- startup animation ----------
+            private fun startIntro(root: FrameLayout) {
+              val iv = IntroView(this)
+              iv.setBackgroundColor(Color.parseColor("#0B0712"))
+              iv.isClickable = true
+              root.addView(iv, FrameLayout.LayoutParams(-1, -1))
+              val a = ValueAnimator.ofFloat(0f, 1f)
+              a.duration = 520
+              a.interpolator = android.view.animation.LinearInterpolator()
+              a.addUpdateListener { v ->
+                iv.t = v.animatedValue as Float
+                iv.invalidate()
+              }
+              a.addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                  iv.animate().alpha(0f).setDuration(160).withEndAction { root.removeView(iv) }.start()
                 }
-                for (x in 0 until len) {
-                  dst[o + x * es] = (255 shl 24) or ((sr / div) shl 16) or ((sg / div) shl 8) or (sb / div)
-                  val a = src[o + (x + r + 1).coerceAtMost(len - 1) * es]
-                  val b = src[o + (x - r).coerceAtLeast(0) * es]
-                  sr += ((a shr 16) and 255) - ((b shr 16) and 255)
-                  sg += ((a shr 8) and 255) - ((b shr 8) and 255)
-                  sb += (a and 255) - (b and 255)
+              })
+              iv.setOnClickListener { a.end() }
+              a.start()
+            }
+
+            // ---------- live sensors (gyro, auto-exposure values from the preview) ----------
+            private val gyroL = object : SensorEventListener {
+              override fun onSensorChanged(e: SensorEvent) {
+                val x = e.values[0]
+                val y = e.values[1]
+                val z = e.values[2]
+                val m = Math.sqrt((x * x + y * y + z * z).toDouble()).toFloat()
+                omegaFast = if (omegaFast < 0f) m else omegaFast + (m - omegaFast) * 0.25f
+                omegaSlow = if (omegaSlow < 0f) m else omegaSlow + (m - omegaSlow) * 0.06f
+                if (omegaFast > burstMaxOmega) burstMaxOmega = omegaFast
+              }
+
+              override fun onAccuracyChanged(s: Sensor?, a: Int) {}
+            }
+
+            private fun gyroSet(on: Boolean) {
+              try {
+                if (on && !gyroOn) {
+                  val m = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+                  sm = m
+                  val g = m.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+                  if (g != null) gyroOn = m.registerListener(gyroL, g, SensorManager.SENSOR_DELAY_GAME)
+                } else if (!on && gyroOn) {
+                  sm?.unregisterListener(gyroL)
+                  gyroOn = false
+                  omegaFast = -1f
+                  omegaSlow = -1f
+                }
+              } catch (e: Exception) {
+                gyroOn = false
+              }
+            }
+
+            private val aeWatch = object : CameraCaptureSession.CaptureCallback() {
+              override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                val fd = result.get(CaptureResult.LENS_FOCUS_DISTANCE)
+                if (fd != null) focusDist = fd
+                val am = result.get(CaptureResult.CONTROL_AE_MODE)
+                if (am != null && am != CaptureRequest.CONTROL_AE_MODE_OFF) {
+                  val t = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+                  val s = result.get(CaptureResult.SENSOR_SENSITIVITY)
+                  if (t != null && s != null) {
+                    aeNs = t
+                    aeIso = s
+                  }
                 }
               }
             }
 
-            private fun boxBlur(px: IntArray, w: Int, h: Int, r: Int): IntArray {
-              val t = IntArray(px.size)
-              val o = IntArray(px.size)
-              blur1d(px, t, h, w, w, 1, r)
-              blur1d(t, o, w, h, 1, w, r)
-              return o
+            private fun modeInfo(): String {
+              if (mode == 1) return resN[resIdx] + (if (rawVideo) " RAW" else "")
+              if (mode == 3) return if (hwBokeh) "Portrait: hardware blur" else "Portrait: software blur"
+              if (mode == 4) return "Enhanced photo" + (if (hasOis) "  |  OIS" else "")
+              if (mode == 5) {
+                return if (astroSub == 0) "Moon: zoom in, tap the moon to focus"
+                else if (astroSub == 1) "Stars: use a tripod or rest the phone"
+                else "Star trails: tripod needed, keep the phone still"
+              }
+              return ""
             }
+
+            private fun astroZoomPreset() {
+              if (mode != 5) return
+              if (astroSub == 0) zoomTo(Math.min(zmax, 8f)) else zoomTo(1f)
+              info.text = modeInfo()
+            }
+
+            // ---------- picture helpers ----------
+            private fun decodeLimited(bytes: ByteArray, limit: Int): Bitmap? {
+              val o = BitmapFactory.Options()
+              o.inJustDecodeBounds = true
+              BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o)
+              var ss = 1
+              while (Math.max(o.outWidth, o.outHeight) / ss > limit) ss *= 2
+              val o2 = BitmapFactory.Options()
+              o2.inSampleSize = ss
+              return BitmapFactory.decodeByteArray(bytes, 0, bytes.size, o2)
+            }
+
+            private fun sizeLimit(md: Int): Int {
+              val big = Runtime.getRuntime().maxMemory() >= 400L * 1024L * 1024L
+              return if (md == 3) 3200 else if (big) 4200 else 3300
+            }
+
+            private fun photoParams(z: Float): EnhParams = EnhParams(procLevel, !procOn, sharpLv, beautyLv, colBoost, z > 1.9f, 1f, 1f)
+
+            private fun enhanceInts(px: IntArray, w: Int, h: Int, p: EnhParams, faces: List<Rect>): IntArray {
+              val fa = IntArray(faces.size * 4)
+              for (i in faces.indices) {
+                fa[4 * i] = faces[i].left
+                fa[4 * i + 1] = faces[i].top
+                fa[4 * i + 2] = faces[i].right
+                fa[4 * i + 3] = faces[i].bottom
+              }
+              return Algo.enhance(px, w, h, p, fa)
+            }
+
+            private fun jpegOf(px: IntArray, w: Int, h: Int): ByteArray {
+              val bm = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+              bm.setPixels(px, 0, w, 0, 0, w, h)
+              val bos = ByteArrayOutputStream(1 shl 21)
+              bm.compress(Bitmap.CompressFormat.JPEG, 95, bos)
+              bm.recycle()
+              return bos.toByteArray()
+            }
+
+            private fun saveJpeg(out: ByteArray, label: String) {
+              val cv = ContentValues()
+              cv.put(MediaStore.Images.Media.DISPLAY_NAME, "ProCam_${System.currentTimeMillis()}")
+              cv.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+              cv.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/ProCam")
+              val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv)
+              if (uri != null) contentResolver.openOutputStream(uri)?.use { it.write(out) }
+              runOnUiThread { saved(uri, "image/*", label) }
+            }
+
+            // face boxes for an image that only exists as an int array (nearest-neighbour thumbnail, boxes mapped back)
+            private fun facesOfInts(px: IntArray, w: Int, h: Int): List<Rect> {
+              return try {
+                val sc = Math.min(1f, 1000f / Math.max(w, h))
+                val sw = Math.max(1, (w * sc).toInt())
+                val sh = Math.max(1, (h * sc).toInt())
+                val small = IntArray(sw * sh)
+                for (y in 0 until sh) {
+                  val sy = Math.min(h - 1, (y / sc).toInt())
+                  for (x in 0 until sw) small[y * sw + x] = px[sy * w + Math.min(w - 1, (x / sc).toInt())]
+                }
+                val bm = Bitmap.createBitmap(sw, sh, Bitmap.Config.ARGB_8888)
+                bm.setPixels(small, 0, sw, 0, 0, sw, sh)
+                val r = detectFaces(bm)
+                bm.recycle()
+                val res = ArrayList<Rect>()
+                for (f in r) res.add(Rect((f.left / sc).toInt(), (f.top / sc).toInt(), (f.right / sc).toInt(), (f.bottom / sc).toInt()))
+                res
+              } catch (e: Throwable) {
+                emptyList<Rect>()
+              }
+            }
+
+            // median luma of a small decode of a test frame, -1 on failure
+            private fun meterLuma(bytes: ByteArray): Int {
+              val bmp = decodeLimited(bytes, 640) ?: return -1
+              val w = bmp.width
+              val h = bmp.height
+              val px = IntArray(w * h)
+              bmp.getPixels(px, 0, w, 0, 0, w, h)
+              bmp.recycle()
+              return Astro.skyLevel(px, w, h)
+            }
+
+            // ---------- Enhanced Photo + Astronomy: burst capture ----------
+            private fun frameMs(p: BurstPlan): Long = if (p.manual) p.expNs / 1_000_000L + 450L else 700L
+
+            private fun ringAt(k: Int): Float {
+              val n = Math.max(1, burstPlan?.frames ?: 1)
+              val base = if (burstSub >= 2) 0.05f else 0f
+              return Math.min(1f, base + (1f - base) * k / n)
+            }
+
+            private fun burstStart() {
+              if (camera == null || img == null) return
+              if (procBusy) {
+                toast("Still processing the last photo, please wait")
+                return
+              }
+              gyroSet(true)
+              burstSub = if (mode == 4) 0 else 1 + astroSub
+              val om = Math.max(omegaFast, omegaSlow)
+              burstTripod = omegaSlow >= 0f && omegaSlow <= 0.006f
+              burstFocusLock = false
+              val plan: BurstPlan
+              if (burstSub == 0) {
+                plan = Plan.enhanced(aeNs, aeIso, om, hasOis, enhTimeVals[enhTimeIdx], isoLo, isoHi, expLo, expHi, manualCap)
+              } else if (!manualCap) {
+                toast("This camera does not allow manual exposure here, results may be limited")
+                plan = BurstPlan(if (burstSub == 3) 20 else 8, 0L, 0, false, "auto")
+              } else if (burstSub == 1) {
+                plan = Plan.moon(apertureF, isoLo, expLo, expHi)
+              } else {
+                plan = Plan.skyTrial(isoLo, isoHi, expLo, expHi)
+              }
+              burstOn = true
+              burstStopReq = false
+              burstInFlight = false
+              burstMeter = plan.note == "meter"
+              burstZ = zCur
+              burstDone = 0
+              burstErrors = 0
+              burstMaxOmega = 0f
+              burstPlan = plan
+              burstT0 = System.nanoTime()
+              procBusy = true
+              val q = LinkedBlockingQueue<BFrame>()
+              burstQ = q
+              val sub = burstSub
+              val z = burstZ
+              Thread { burstWork(q, sub, z) }.start()
+              img?.flashMode = ImageCapture.FLASH_MODE_OFF
+              flashView.alpha = 0.5f
+              flashView.animate().alpha(0f).setDuration(200).start()
+              updateShutter()
+              ring.reset()
+              if (burstMeter) {
+                info.text = "Measuring the sky..."
+                ring.sweep(0.05f, 1600L)
+              } else {
+                info.text = "Hold still  0 / ${plan.frames}"
+                ring.sweep(ringAt(1), frameMs(plan))
+              }
+              burstApply()
+            }
+
+            private fun burstOptions(cam: Camera, plan: BurstPlan): CaptureRequestOptions {
+              val b = CaptureRequestOptions.Builder()
+              b.setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+              b.setCaptureRequestOption(CaptureRequest.CONTROL_AWB_LOCK, true)
+              if (plan.manual) {
+                b.setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
+                b.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, plan.expNs)
+                b.setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, plan.iso)
+                if (plan.expNs > 100_000_000L && maxFrameNs > 0L) {
+                  b.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, Math.min(plan.expNs + 5_000_000L, maxFrameNs))
+                }
+              }
+              try {
+                val ci = Camera2CameraInfo.from(cam.cameraInfo)
+                if (hasOis) {
+                  val off = burstSub >= 2 && burstTripod
+                  b.setCaptureRequestOption(
+                    CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+                    if (off) CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF else CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON
+                  )
+                }
+                val nr = ci.getCameraCharacteristic(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
+                if (nr != null) {
+                  if (nr.contains(CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)) {
+                    b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_MINIMAL)
+                  } else if (nr.contains(CaptureRequest.NOISE_REDUCTION_MODE_OFF)) {
+                    b.setCaptureRequestOption(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_OFF)
+                  }
+                }
+                val ed = ci.getCameraCharacteristic(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+                if (ed != null && ed.contains(CaptureRequest.EDGE_MODE_OFF)) {
+                  b.setCaptureRequestOption(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_OFF)
+                }
+                if (burstSub >= 2 && plan.manual && minFocus > 0f) {
+                  b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                  b.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, 0f)
+                } else if (burstFocusLock && minFocus > 0f && focusDist >= 0f) {
+                  // focus was settled by the first frame: keep exactly that focus for the rest of the burst
+                  b.setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                  b.setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDist)
+                }
+              } catch (e: Throwable) {
+              }
+              return b.build()
+            }
+
+            // sets the burst camera options, then takes the next frame
+            private fun burstApply() {
+              val cam = camera
+              val plan = burstPlan
+              if (cam == null || plan == null) {
+                burstFinish()
+                return
+              }
+              try {
+                val c2 = Camera2CameraControl.from(cam.cameraControl)
+                val fut = c2.setCaptureRequestOptions(burstOptions(cam, plan))
+                fut.addListener({ burstFire() }, ContextCompat.getMainExecutor(this))
+              } catch (e: Throwable) {
+                burstFire()
+              }
+            }
+
+            private fun burstFire() {
+              if (!burstOn) return
+              val ic = img
+              if (ic == null || burstStopReq) {
+                burstFinish()
+                return
+              }
+              burstInFlight = true
+              burstMaxOmega = 0f
+              try {
+                ic.takePicture(ContextCompat.getMainExecutor(this), burstCb)
+              } catch (e: Throwable) {
+                burstOnError(e.message ?: "capture failed")
+              }
+            }
+
+            private val burstCb = object : ImageCapture.OnImageCapturedCallback() {
+              override fun onCaptureSuccess(image: ImageProxy) {
+                var got: ByteArray? = null
+                var rot = 0
+                try {
+                  val buf = image.planes[0].buffer
+                  val bb = ByteArray(buf.remaining())
+                  buf.get(bb)
+                  got = bb
+                  rot = image.imageInfo.rotationDegrees
+                } catch (e: Throwable) {
+                } finally {
+                  image.close()
+                }
+                val data = got
+                if (data == null) burstOnError("read failed") else burstOnFrame(data, rot)
+              }
+
+              override fun onError(e: ImageCaptureException) {
+                burstOnError(e.message ?: "capture error")
+              }
+            }
+
+            private fun burstOnFrame(bytes: ByteArray, rot: Int) {
+              burstInFlight = false
+              val q = burstQ
+              val plan = burstPlan
+              if (!burstOn || q == null || plan == null) return
+              val om = burstMaxOmega
+              if (burstMeter) {
+                q.put(BFrame(bytes, om, rot, 3))
+                return
+              }
+              q.put(BFrame(bytes, om, rot, 0))
+              burstDone++
+              val n = plan.frames
+              info.text = "Hold still  $burstDone / $n"
+              ring.sweep(ringAt(burstDone + 1), frameMs(plan))
+              if (burstStopReq || burstDone >= n) {
+                burstFinish()
+              } else if (burstDone == 1 && burstSub < 2) {
+                burstFocusLock = true
+                burstApply()
+              } else {
+                burstFire()
+              }
+            }
+
+            private fun burstOnError(msg: String) {
+              burstInFlight = false
+              if (!burstOn) return
+              burstErrors++
+              if (burstErrors <= 2 && !burstStopReq) {
+                handler.postDelayed({ burstFire() }, 250)
+              } else {
+                toast("Capture problem: $msg")
+                burstFinish()
+              }
+            }
+
+            // the worker measured the sky from the test frame: pick the real exposure and start capturing
+            private fun burstAfterMeter(luma: Int) {
+              if (!burstOn) return
+              val tr = burstPlan
+              if (tr == null || luma < 0) {
+                toast("Could not measure the sky")
+                burstFinish()
+                return
+              }
+              if (burstStopReq) {
+                burstFinish()
+                return
+              }
+              val ex = Plan.skyExposure(tr.expNs, tr.iso, luma, burstTripod, 5_000_000_000L, isoLo, isoHi, expLo, expHi, if (burstSub == 3) 40 else 48)
+              val n = if (burstSub == 2) Plan.starsFrames(starSecVals[starSecIdx], ex[0], 15)
+              else Plan.trailsFrames(trailMinVals[trailMinIdx], ex[0], 240)
+              val np = BurstPlan(n, ex[0], ex[1].toInt(), true, "sky")
+              burstPlan = np
+              burstMeter = false
+              burstDone = 0
+              burstT0 = System.nanoTime()
+              info.text = "Hold still  0 / $n"
+              ring.sweep(ringAt(1), frameMs(np))
+              if (!burstTripod) toast("The phone is not steady, use a tripod or rest it on something")
+              burstApply()
+            }
+
+            private fun burstStop() {
+              burstStopReq = true
+              info.text = "Finishing..."
+              if (!burstInFlight) burstFinish()
+            }
+
+            private fun burstFinish() {
+              if (!burstOn) return
+              burstOn = false
+              val q = burstQ
+              burstQ = null
+              try {
+                val cam = camera
+                if (cam != null) Camera2CameraControl.from(cam.cameraControl).clearCaptureRequestOptions()
+              } catch (e: Throwable) {
+              }
+              applyManual()
+              applyFlash()
+              ring.reset()
+              updateShutter()
+              info.text = "Processing..."
+              toast("Processing...")
+              q?.put(BFrame(ByteArray(0), 0f, 0, 1))
+            }
+
+            // ---------- burst worker (own thread): decode, merge / stack, finish, save ----------
+            private fun burstWork(q: LinkedBlockingQueue<BFrame>, sub: Int, z: Float) {
+              var merger: Merger? = null
+              var acc: IntArray? = null
+              var w = 0
+              var h = 0
+              var rot = 0
+              var used = 0
+              var dropped = 0
+              var firstBytes: ByteArray? = null
+              var out: ByteArray? = null
+              var label = ""
+              synchronized(heavy) {
+                try {
+                  val limit = sizeLimit(0)
+                  while (true) {
+                    val f = q.take()
+                    if (f.kind == 1) break
+                    if (f.kind == 3) {
+                      val lv = try { meterLuma(f.bytes) } catch (e: Throwable) { -1 }
+                      runOnUiThread { burstAfterMeter(lv) }
+                      continue
+                    }
+                    if (sub == 3 && f.omega > 0.03f) {
+                      dropped++
+                      continue
+                    }
+                    val bmp = decodeLimited(f.bytes, limit) ?: continue
+                    val fw = bmp.width
+                    val fh = bmp.height
+                    val px = IntArray(fw * fh)
+                    bmp.getPixels(px, 0, fw, 0, 0, fw, fh)
+                    bmp.recycle()
+                    if (used == 0) {
+                      w = fw
+                      h = fh
+                      rot = f.rot
+                      if (sub == 3) {
+                        Astro.despeckle(px, w, h)
+                        acc = px
+                      } else {
+                        merger = Merger(w, h, px)
+                        firstBytes = f.bytes
+                      }
+                      used = 1
+                    } else if (fw == w && fh == h) {
+                      if (sub == 3) {
+                        Astro.despeckle(px, w, h)
+                        val a = acc
+                        if (a != null) Astro.maxInto(a, px)
+                      } else {
+                        val m = merger
+                        if (m != null) m.add(px)
+                      }
+                      used++
+                    }
+                  }
+                  if (used > 0) {
+                    var px: IntArray = if (sub == 3) (acc ?: IntArray(0)) else (merger?.finish() ?: IntArray(0))
+                    merger = null
+                    acc = null
+                    val ep: EnhParams
+                    if (sub == 1) {
+                      Astro.moonStretch(px, w, h)
+                      ep = EnhParams(1, false, 3, 0, false, true, 1f, 1f)
+                      label = "Moon Photo Saved"
+                    } else if (sub == 2) {
+                      Astro.despeckle(px, w, h)
+                      Astro.skyStretch(px, w, h, 8f, 0.75f, 1.15f)
+                      ep = EnhParams(2, false, 1, 0, false, false, 1f, 1f)
+                      label = "Stars Photo Saved"
+                    } else if (sub == 3) {
+                      Astro.skyStretch(px, w, h, 8f, 0.9f, 1.15f)
+                      ep = EnhParams(2, false, 1, 0, false, false, 1f, 1f)
+                      label = "Star Trails Saved ($used frames)"
+                    } else {
+                      ep = photoParams(z)
+                      label = "Enhanced Photo Saved ($used frames)"
+                    }
+                    var ww = w
+                    var hh = h
+                    if (rot % 180 != 0) {
+                      ww = h
+                      hh = w
+                    }
+                    if (rot != 0) px = Astro.rotateInts(px, w, h, rot)
+                    val faces = if (sub == 0 && procOn && beautyLv > 0) facesOfInts(px, ww, hh) else emptyList<Rect>()
+                    val res = enhanceInts(px, ww, hh, ep, faces)
+                    px = IntArray(0)
+                    out = jpegOf(res, ww, hh)
+                  } else {
+                    runOnUiThread { toast("No photo was captured") }
+                  }
+                } catch (e: OutOfMemoryError) {
+                  merger = null
+                  acc = null
+                  out = null
+                  System.gc()
+                  val fb = firstBytes
+                  if (fb != null) {
+                    runOnUiThread { toast("Low memory, saving a single frame") }
+                    processAndSave(fb, rot, z, 0)
+                  } else {
+                    runOnUiThread { toast("Not enough memory for this shot") }
+                  }
+                } catch (e: Throwable) {
+                  out = null
+                  runOnUiThread { toast("Error: ${e.message}") }
+                }
+              }
+              val done = out
+              if (done != null) {
+                try {
+                  saveJpeg(done, label)
+                } catch (e: Throwable) {
+                  runOnUiThread { toast("Error: ${e.message}") }
+                }
+              }
+              procBusy = false
+              runOnUiThread {
+                ring.reset()
+                if (!burstOn) info.text = modeInfo()
+              }
+            }
+
+            private fun c8(v: Float): Int = if (v < 0f) 0 else if (v > 255f) 255 else v.toInt()
 
             private fun boxF(src: FloatArray, w: Int, h: Int, r: Int): FloatArray {
               val t = FloatArray(src.size)
@@ -1587,146 +3956,6 @@ jobs:
               } catch (e: Throwable) {
                 emptyList<Rect>()
               }
-            }
-
-            private fun enhance(src: Bitmap, lv: Int, boost: Boolean, faces: List<Rect>, lite: Boolean): Bitmap {
-              val w = src.width
-              val h = src.height
-              val px = IntArray(w * h)
-              src.getPixels(px, 0, w, 0, 0, w, h)
-              val bl = boxBlur(px, w, h, 2)
-              val bLv = if (lite) 0 else beautyLv
-              // face weight map (0..255), soft ellipse around every detected face
-              val fw = ByteArray(w * h)
-              if (bLv > 0 && faces.isNotEmpty()) {
-                for (f in faces) {
-                  val cx = (f.left + f.right) / 2f
-                  val cy = (f.top + f.bottom) / 2f - f.height() * 0.04f
-                  val rx = f.width() * 0.62f
-                  val ry = f.height() * 0.72f
-                  if (rx < 4f || ry < 4f) continue
-                  val y0 = Math.max(0, (cy - ry).toInt())
-                  val y1 = Math.min(h - 1, (cy + ry).toInt())
-                  val x0 = Math.max(0, (cx - rx).toInt())
-                  val x1 = Math.min(w - 1, (cx + rx).toInt())
-                  for (y in y0..y1) {
-                    val dy = (y - cy) / ry
-                    for (x in x0..x1) {
-                      val dx = (x - cx) / rx
-                      val d = dx * dx + dy * dy
-                      if (d < 1f) {
-                        val v = Math.min(1f, (1f - d) * 2f)
-                        val iv = (v * 255f).toInt()
-                        val i = y * w + x
-                        if (iv > (fw[i].toInt() and 255)) fw[i] = iv.toByte()
-                      }
-                    }
-                  }
-                }
-              }
-              // coarse local-brightness map for shadow / highlight balancing
-              val gs = 16
-              val gw = (w + gs - 1) / gs
-              val gh = (h + gs - 1) / gs
-              var lg = FloatArray(gw * gh)
-              if (!lite) {
-                val gc = IntArray(gw * gh)
-                var yy = 0
-                while (yy < h) {
-                  var xx = 0
-                  while (xx < w) {
-                    val p = px[yy * w + xx]
-                    val l = (((p shr 16) and 255) * 77 + ((p shr 8) and 255) * 151 + (p and 255) * 28) shr 8
-                    val gi = (yy / gs) * gw + xx / gs
-                    lg[gi] += l.toFloat()
-                    gc[gi]++
-                    xx += 4
-                  }
-                  yy += 4
-                }
-                for (i in lg.indices) lg[i] = if (gc[i] > 0) lg[i] / gc[i] / 255f else 0.5f
-                lg = boxF(lg, gw, gh, 2)
-                lg = boxF(lg, gw, gh, 2)
-              }
-              val dnS = if (lite) 0.35f else floatArrayOf(0.45f, 0.65f, 0.85f)[lv] + (if (boost) 0.15f else 0f)
-              val shK = if (lite) 0.5f else floatArrayOf(0f, 0.5f, 0.9f, 1.35f)[sharpLv]
-              val sat = if (lite) 1f else floatArrayOf(1.03f, 1.08f, 1.14f)[lv]
-              val vib = if (lite) 0f else floatArrayOf(0.12f, 0.2f, 0.3f)[lv]
-              val tone = if (lite) 0f else floatArrayOf(0.7f, 1f, 1.3f)[lv]
-              val bBright = floatArrayOf(0f, 0.05f, 0.09f, 0.14f)[bLv]
-              val bSmooth = floatArrayOf(0f, 0.25f, 0.45f, 0.65f)[bLv]
-              val cBoost = colBoost && !lite
-              val warm = if (lite) 0f else 0.01f
-              val lut = IntArray(256)
-              for (i in 0..255) {
-                if (lite) {
-                  lut[i] = i
-                } else {
-                  val x = i / 255f
-                  val y = 0.75f * x + 0.25f * x * x * (3f - 2f * x)
-                  lut[i] = c8(255f * Math.pow(y.toDouble(), 0.97).toFloat())
-                }
-              }
-              for (y in 0 until h) {
-                val gy = (y + 0.5f) / gs - 0.5f
-                val y0 = gy.toInt().coerceIn(0, gh - 1)
-                val y1 = Math.min(gh - 1, y0 + 1)
-                val fy = (gy - y0).coerceIn(0f, 1f)
-                for (x in 0 until w) {
-                  val i = y * w + x
-                  val p = px[i]
-                  val q = bl[i]
-                  val r = (p shr 16) and 255
-                  val g = (p shr 8) and 255
-                  val b = p and 255
-                  val qr = (q shr 16) and 255
-                  val qg = (q shr 8) and 255
-                  val qb = q and 255
-                  val fwv = (fw[i].toInt() and 255) / 255f
-                  val d = Math.abs(((r - qr) * 77 + (g - qg) * 151 + (b - qb) * 28) shr 8)
-                  val t = Math.min(1f, d / 22f)
-                  val m = Math.min(0.95f, dnS * (1f - t) + bSmooth * fwv * (1f - 0.5f * t))
-                  val k = shK * t * (1f - 0.75f * fwv)
-                  var r2 = r + (qr - r) * m + ((r - qr) * k).coerceIn(-36f, 36f)
-                  var g2 = g + (qg - g) * m + ((g - qg) * k).coerceIn(-36f, 36f)
-                  var b2 = b + (qb - b) * m + ((b - qb) * k).coerceIn(-36f, 36f)
-                  var gain = 1f
-                  if (tone > 0f) {
-                    val gx = (x + 0.5f) / gs - 0.5f
-                    val x0 = gx.toInt().coerceIn(0, gw - 1)
-                    val x1 = Math.min(gw - 1, x0 + 1)
-                    val fx = (gx - x0).coerceIn(0f, 1f)
-                    val loc = (lg[y0 * gw + x0] * (1f - fx) + lg[y0 * gw + x1] * fx) * (1f - fy) +
-                      (lg[y1 * gw + x0] * (1f - fx) + lg[y1 * gw + x1] * fx) * fy
-                    val dk = 1f - loc
-                    val ht = ((loc - 0.62f) / 0.38f).coerceIn(0f, 1f)
-                    gain = (1f + 0.38f * tone * dk * dk * dk) * (1f - 0.16f * tone * ht * ht * (3f - 2f * ht))
-                  }
-                  val cb = 128f - 0.169f * r2 - 0.331f * g2 + 0.5f * b2
-                  val cr = 128f + 0.5f * r2 - 0.419f * g2 - 0.081f * b2
-                  val skin = cb >= 77f && cb <= 127f && cr >= 133f && cr <= 173f
-                  if (fwv > 0f) {
-                    val lum0 = (r2 * 0.30f + g2 * 0.59f + b2 * 0.11f) / 255f
-                    gain *= 1f + bBright * fwv * (if (skin) 1f else 0.35f) * (1.15f - lum0)
-                  }
-                  r2 *= gain
-                  g2 *= gain
-                  b2 *= gain
-                  val mx = Math.max(r2, Math.max(g2, b2))
-                  val mn = Math.min(r2, Math.min(g2, b2))
-                  val cs = if (mx > 1f) (mx - mn) / mx else 0f
-                  var sc = sat + vib * (1f - cs) * (if (skin) 0.35f else 1f)
-                  if (cBoost && !skin && cs > 0.38f) sc += 0.14f * Math.min(1f, (cs - 0.38f) / 0.3f)
-                  val l = r2 * 0.30f + g2 * 0.59f + b2 * 0.11f
-                  val r3 = (l + (r2 - l) * sc) * (1f + warm)
-                  val g3 = l + (g2 - l) * sc
-                  val b3 = (l + (b2 - l) * sc) * (1f - warm)
-                  px[i] = (255 shl 24) or (lut[c8(r3)] shl 16) or (lut[c8(g3)] shl 8) or lut[c8(b3)]
-                }
-              }
-              val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-              out.setPixels(px, 0, w, 0, 0, w, h)
-              return out
             }
 
             private fun portrait(src: Bitmap, faces: List<Rect>): Bitmap? {
